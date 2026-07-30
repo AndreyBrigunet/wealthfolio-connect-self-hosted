@@ -45,7 +45,7 @@ var _ = Describe("SnapTrade mapping", func() {
 		Entry("transfer in", "TRANSFER_IN", brokerage.ActivityTransferIn, false),
 		Entry("transfer out", "TRANSFER_OUT", brokerage.ActivityTransferOut, false),
 		Entry("conversion", "CONVERSION", brokerage.ActivityConversion, false),
-		Entry("split", "SPLIT", brokerage.ActivitySplit, false),
+		Entry("split without a ratio needs review", "SPLIT", brokerage.ActivitySplit, true),
 		Entry("expiration", "OPTIONEXPIRATION", brokerage.ActivityOptionExpiry, false),
 		Entry("assignment", "OPTIONASSIGNMENT", brokerage.ActivityOptionAssignment, false),
 		Entry("exercise", "OPTIONEXERCISE", brokerage.ActivityOptionExercise, false),
@@ -90,6 +90,24 @@ var _ = Describe("SnapTrade mapping", func() {
 		Expect(one.SourceFingerprint).NotTo(Equal(otherAccount.SourceFingerprint))
 		Expect(one.NeedsReview).To(BeTrue())
 	})
+
+	DescribeTable("maps SnapTrade split changes to Wealthfolio ratios",
+		func(description string, units, amount decimal, expected float64, review bool) {
+			raw := activityOfType("SPLIT")
+			raw.Description = description
+			raw.Units = units
+			raw.Amount = amount
+			activity, err := mapActivity("account", "remote", raw)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(activity.Type).To(Equal(brokerage.ActivitySplit))
+			Expect(activity.Amount).To(BeNumerically("~", expected, 0.0000001))
+			Expect(activity.NeedsReview).To(Equal(review))
+		},
+		Entry("IBKR NVIDIA 10-for-1", "NVDA SPLIT 10 FOR 1", decimal{Value: 9, Valid: true}, decimal{Value: 0, Valid: true}, 10.0, false),
+		Entry("reverse 1-for-10", "REVERSE SPLIT 1 FOR 10", decimal{Value: -0.9, Valid: true}, decimal{Value: 0, Valid: true}, 0.1, false),
+		Entry("colon notation", "SPLIT 3:2", decimal{}, decimal{}, 1.5, false),
+		Entry("missing ratio", "stock reorganization", decimal{}, decimal{Value: 0, Valid: true}, 0.0, true),
+	)
 
 	It("rejects only the malformed activity with no trade date", func() {
 		raw := activityOfType("DIVIDEND")

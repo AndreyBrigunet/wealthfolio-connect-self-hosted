@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/brokerage"
 )
+
+var splitRatioPattern = regexp.MustCompile(`(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(?:FOR|:)\s*([0-9]+(?:\.[0-9]+)?)\b`)
 
 func isInteractiveBrokers(broker rawBrokerage) bool {
 	for _, value := range []string{broker.Slug, broker.Name, broker.DisplayName} {
@@ -300,6 +304,13 @@ func mapActivity(accountID, rawAccountID string, raw rawActivity) (brokerage.Act
 		value := raw.FXRate.Value
 		a.FxRate = &value
 	}
+	if a.Type == brokerage.ActivitySplit {
+		if ratio, ok := mapSplitRatio(raw); ok {
+			a.Amount = ratio
+		} else {
+			a.NeedsReview = true
+		}
+	}
 	if (a.Type == brokerage.ActivityBuy || a.Type == brokerage.ActivitySell ||
 		a.Type == brokerage.ActivityOptionBuy || a.Type == brokerage.ActivityOptionSell) &&
 		a.Symbol == nil && a.OptionSymbol == nil {
@@ -319,6 +330,18 @@ func mapActivity(accountID, rawAccountID string, raw rawActivity) (brokerage.Act
 		a.SourceGroupID = "snaptrade:external:" + raw.ExternalReferenceID
 	}
 	return a, nil
+}
+
+func mapSplitRatio(raw rawActivity) (float64, bool) {
+	match := splitRatioPattern.FindStringSubmatch(raw.Description)
+	if len(match) == 3 {
+		numerator, numeratorErr := strconv.ParseFloat(match[1], 64)
+		denominator, denominatorErr := strconv.ParseFloat(match[2], 64)
+		if numeratorErr == nil && denominatorErr == nil && numerator > 0 && denominator > 0 {
+			return numerator / denominator, true
+		}
+	}
+	return 0, false
 }
 
 func mapActivityType(rawType string, option bool, amount, units float64) (brokerage.ActivityType, string, bool) {

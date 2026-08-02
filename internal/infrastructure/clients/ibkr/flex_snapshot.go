@@ -46,7 +46,7 @@ func mapFlexSnapshot(report flexReport, remoteAccountID, baseCurrency string, ca
 			continue
 		}
 		switch strings.ToLower(record.Kind) {
-		case "securityinfo":
+		case flexKindSecurityInfo:
 			if conid := flexAttr(record.Attrs, "conid", "conid1"); conid != "" {
 				securities[conid] = record.Attrs
 			}
@@ -93,7 +93,7 @@ func mapFlexSnapshot(report flexReport, remoteAccountID, baseCurrency string, ca
 		assetClass := strings.ToUpper(flexAttr(attrs, "assetcategory", "assetclass", "sectype"))
 		markPrice, _ := flexFloat(record.Attrs, "markprice", "closeprice", "price")
 		averagePrice, _ := flexFloat(record.Attrs, "costbasisprice", "openprice")
-		if assetClass == "OPT" || assetClass == "FOP" {
+		if assetClass == flexAssetClassOption || assetClass == "FOP" {
 			option := flexOptionSymbol(attrs)
 			if option == nil {
 				return domainsync.BrokerSnapshot{}, fmt.Errorf("ibkr flex: open option position omitted contract fields for conid %s", maskFlexIdentifier(flexAttr(attrs, "conid")))
@@ -152,15 +152,15 @@ func flexRecordMatchesAccount(record flexRecord, expected string) bool {
 	return accountID == "" || accountID == expected
 }
 
-func flexAccountType(attrs map[string]string) (brokerage.AccountType, string) {
-	raw := strings.ToUpper(flexAttr(attrs, "accounttype", "type"))
+func flexAccountType(attrs map[string]string) (accountType brokerage.AccountType, rawType string) {
+	rawType = strings.ToUpper(flexAttr(attrs, "accounttype", "type"))
 	switch {
-	case strings.Contains(raw, "CASH"):
-		return brokerage.AccountTypeCash, raw
-	case strings.Contains(raw, "MARGIN"):
-		return brokerage.AccountTypeMargin, raw
+	case strings.Contains(rawType, "CASH"):
+		return brokerage.AccountTypeCash, rawType
+	case strings.Contains(rawType, "MARGIN"):
+		return brokerage.AccountTypeMargin, rawType
 	default:
-		return brokerage.AccountTypeMargin, raw
+		return brokerage.AccountTypeMargin, rawType
 	}
 }
 

@@ -412,7 +412,7 @@ func validateIBKRFlex(cfg *IBKRFlexConfig, ibkr IBKRConfig) error {
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
 		return errors.New("config: IBKR_FLEX_BASE_URL must be an absolute URL")
 	}
-	if parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && isLoopbackHost(parsedURL.Hostname())) {
+	if parsedURL.Scheme != "https" && (parsedURL.Scheme != "http" || !isLoopbackHost(parsedURL.Hostname())) {
 		return errors.New("config: IBKR_FLEX_BASE_URL must use HTTPS (HTTP is allowed only for loopback tests)")
 	}
 	if len(cfg.BaseCurrency) != 3 {

@@ -96,8 +96,8 @@ func (a *flexAPI) fetch(ctx context.Context, from, to time.Time) (flexReport, er
 		return flexReport{}, fmt.Errorf("request statement: %w", err)
 	}
 	var response flexServiceResponse
-	if err := xml.Unmarshal(body, &response); err != nil {
-		return flexReport{}, fmt.Errorf("decode request response: %w", err)
+	if decodeErr := xml.Unmarshal(body, &response); decodeErr != nil {
+		return flexReport{}, fmt.Errorf("decode request response: %w", decodeErr)
 	}
 	if !strings.EqualFold(strings.TrimSpace(response.Status), "Success") {
 		return flexReport{}, redactFlexError(flexResponseError(response), a.token)
@@ -135,8 +135,8 @@ func (a *flexAPI) fetch(ctx context.Context, from, to time.Time) (flexReport, er
 		}
 
 		response = flexServiceResponse{}
-		if err := xml.Unmarshal(body, &response); err != nil {
-			return flexReport{}, fmt.Errorf("decode statement response: %w", err)
+		if decodeErr := xml.Unmarshal(body, &response); decodeErr != nil {
+			return flexReport{}, fmt.Errorf("decode statement response: %w", decodeErr)
 		}
 		if !isFlexPending(response) {
 			return flexReport{}, redactFlexError(flexResponseError(response), a.token)
@@ -193,7 +193,7 @@ func (a *flexAPI) statementURL(raw string) (url.URL, error) {
 }
 
 func (a *flexAPI) get(ctx context.Context, target url.URL) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("build HTTP request: %w", err)
 	}
@@ -208,7 +208,9 @@ func (a *flexAPI) get(ctx context.Context, target url.URL) ([]byte, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		if _, copyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 4096)); copyErr != nil {
+			return nil, fmt.Errorf("discard HTTP error response: %w", copyErr)
+		}
 		return nil, fmt.Errorf("HTTP status %d", response.StatusCode)
 	}
 	limited := io.LimitReader(response.Body, flexMaxResponseBytes+1)
@@ -288,7 +290,7 @@ func decodeFlexReport(reader io.Reader) (flexReport, error) {
 func isFlexActivityRecord(kind string) bool {
 	switch strings.ToLower(kind) {
 	case "trade", "cashtransaction", "corporateaction", "transfer", "tradetransfer", "optioneae",
-		"conversionrate", "securityinfo", "transactiontax", "brokeragefee", "clientfee",
+		"conversionrate", flexKindSecurityInfo, "transactiontax", "brokeragefee", "clientfee",
 		"transactionfee", "slbactivity", "debitcardactivity", "accountinformation",
 		"openposition", "cashreportcurrency", "netassetvaluebyreportdateinbase",
 		"equitysummarybyreportdateinbase":

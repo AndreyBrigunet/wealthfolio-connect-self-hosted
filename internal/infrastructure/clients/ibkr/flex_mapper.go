@@ -17,6 +17,12 @@ import (
 
 const flexInstitutionName = "Interactive Brokers"
 
+const (
+	flexAssetClassOption = "OPT"
+	flexKindSecurityInfo = "securityinfo"
+	flexSubtypeFXTrade   = "FXEXCHANGE"
+)
+
 var flexSplitPattern = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:FOR|:|/)\s*([0-9]+(?:\.[0-9]+)?)`)
 
 var flexExchangeMICs = map[string]string{
@@ -44,7 +50,7 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 	rates := make(map[flexRateKey]float64)
 	for _, record := range report.Records {
 		switch strings.ToLower(record.Kind) {
-		case "securityinfo":
+		case flexKindSecurityInfo:
 			if conid := flexAttr(record.Attrs, "conid", "conid1"); conid != "" {
 				securities[conid] = record.Attrs
 			}
@@ -57,7 +63,7 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 	result := flexMappingResult{}
 	for _, record := range report.Records {
 		kind := strings.ToLower(record.Kind)
-		if isFlexSnapshotRecord(kind) || kind == "securityinfo" || kind == "conversionrate" {
+		if isFlexSnapshotRecord(kind) || kind == flexKindSecurityInfo || kind == "conversionrate" {
 			continue
 		}
 		if accountID := flexAttr(record.Attrs, "accountid", "account"); accountID != "" && accountID != remoteAccountID {
@@ -73,7 +79,8 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 			activities = expandFlexConversion(activity, record)
 		}
 		for _, mapped := range activities {
-			if isFlexNativeCurrencyTrade(mapped.Type) {
+			switch {
+			case isFlexNativeCurrencyTrade(mapped.Type):
 				// IBKR's fxRateToBase and CurrencyConversionRates fields are
 				// statement-translation rates. They do not mean that IBKR
 				// converted the cash leg of a security trade into the account
@@ -81,12 +88,12 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 				// so forwarding the reporting rate would debit non-base BUYs
 				// from base-currency cash instead of their native cash balance.
 				mapped.FxRate = nil
-			} else if mapped.FxRate == nil && mapped.Currency.Code != "" && !strings.EqualFold(mapped.Currency.Code, baseCurrency) {
+			case mapped.FxRate == nil && mapped.Currency.Code != "" && !strings.EqualFold(mapped.Currency.Code, baseCurrency):
 				date := mapped.TradeDate.UTC().Format("2006-01-02")
 				if rate, ok := rates[flexRateKey{Date: date, Currency: strings.ToUpper(mapped.Currency.Code)}]; ok {
 					mapped.FxRate = &rate
 				}
-			} else if mapped.FxRate == nil && strings.EqualFold(mapped.Currency.Code, baseCurrency) {
+			case mapped.FxRate == nil && strings.EqualFold(mapped.Currency.Code, baseCurrency):
 				rate := 1.0
 				mapped.FxRate = &rate
 			}
@@ -134,7 +141,7 @@ func expandFlexConversion(activity brokerage.Activity, record flexRecord) []brok
 	}
 	if !ok || baseAmount == 0 || quoteAmount == 0 || buyBase == sellBase {
 		activity.Type = brokerage.ActivityUnknown
-		activity.Subtype = "FXEXCHANGE"
+		activity.Subtype = flexSubtypeFXTrade
 		activity.NeedsReview = true
 		activity.CurrencySymbol = nil
 		return []brokerage.Activity{activity}
@@ -154,7 +161,7 @@ func expandFlexConversion(activity brokerage.Activity, record flexRecord) []brok
 			leg.ID = "ibkr-flex-activity-" + flexHash(activity.ID+"\x00"+direction)
 		}
 		leg.Type = activityType
-		leg.Subtype = "FXEXCHANGE"
+		leg.Subtype = flexSubtypeFXTrade
 		leg.Price = 0
 		leg.Units = 0
 		leg.Amount = amount
@@ -204,9 +211,9 @@ func expandFlexConversion(activity brokerage.Activity, record flexRecord) []brok
 	return []brokerage.Activity{outLeg, inLeg}
 }
 
-func flexCurrencyPair(attrs map[string]string) (string, string, bool) {
+func flexCurrencyPair(attrs map[string]string) (baseCurrency, quoteCurrency string, ok bool) {
 	rawSymbol := strings.ToUpper(strings.TrimSpace(flexAttr(attrs, "symbol", "underlyingsymbol")))
-	quoteCurrency := strings.ToUpper(flexAttr(attrs, "currency", "currencyprimary"))
+	quoteCurrency = strings.ToUpper(flexAttr(attrs, "currency", "currencyprimary"))
 	parts := strings.FieldsFunc(rawSymbol, func(r rune) bool {
 		return r == '.' || r == '/' || r == '-' || r == '_'
 	})
@@ -216,7 +223,7 @@ func flexCurrencyPair(attrs map[string]string) (string, string, bool) {
 	if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
 		return "", "", false
 	}
-	baseCurrency := parts[0]
+	baseCurrency = parts[0]
 	if quoteCurrency == "" {
 		quoteCurrency = parts[1]
 	}
@@ -301,7 +308,7 @@ func mapFlexRecord(localAccountID, remoteAccountID string, record flexRecord, se
 			activity.Symbol = symbol
 		}
 	}
-	if assetClass == "OPT" || assetClass == "FOP" {
+	if assetClass == flexAssetClassOption || assetClass == "FOP" {
 		if option := flexOptionSymbol(securityAttrs); option != nil {
 			activity.OptionSymbol = option
 			activity.Symbol = nil
@@ -360,7 +367,7 @@ func flexActivityType(kind, rawType, description string, amount, units float64, 
 		}
 		buy := strings.Contains(combined, "BUY") || strings.Contains(combined, "BOT")
 		sell := strings.Contains(combined, "SELL") || strings.Contains(combined, "SLD")
-		if assetClass == "OPT" || assetClass == "FOP" {
+		if assetClass == flexAssetClassOption || assetClass == "FOP" {
 			if buy {
 				return brokerage.ActivityOptionBuy, "", false
 			}
@@ -466,9 +473,10 @@ func flexOptionSymbol(attrs map[string]string) *brokerage.OptionSymbol {
 		return nil
 	}
 	side := brokerage.OptionSide(putCall)
-	if putCall == "C" {
+	switch putCall {
+	case "C":
 		side = brokerage.OptionCall
-	} else if putCall == "P" {
+	case "P":
 		side = brokerage.OptionPut
 	}
 	underlyingRaw := flexAttr(attrs, "underlyingsymbol", "symbol")

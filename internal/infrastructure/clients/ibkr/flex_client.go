@@ -89,11 +89,11 @@ func (c *FlexClient) FetchAccountSnapshot(ctx context.Context) (domainsync.Broke
 			}
 			return domainsync.BrokerSnapshot{}, fmt.Errorf("latest closed-day Flex snapshot: %w", err)
 		}
-		if err := validateFlexAccount(report, c.accountID); err != nil {
-			return domainsync.BrokerSnapshot{}, err
+		if accountErr := validateFlexAccount(report, c.accountID); accountErr != nil {
+			return domainsync.BrokerSnapshot{}, accountErr
 		}
-		if err := validateFlexSnapshotSections(report); err != nil {
-			return domainsync.BrokerSnapshot{}, err
+		if sectionErr := validateFlexSnapshotSections(report); sectionErr != nil {
+			return domainsync.BrokerSnapshot{}, sectionErr
 		}
 		snapshot, err := mapFlexSnapshot(report, c.accountID, c.config.BaseCurrency, c.now())
 		if err != nil {
@@ -187,8 +187,8 @@ func (c *FlexClient) StreamActivities(ctx context.Context, states []domainsync.A
 			return fmt.Errorf("account %s Flex window %s to %s: %w",
 				maskFlexIdentifier(c.accountID), from.Format("2006-01-02"), to.Format("2006-01-02"), err)
 		}
-		if err := validateFlexAccount(report, c.accountID); err != nil {
-			return err
+		if accountErr := validateFlexAccount(report, c.accountID); accountErr != nil {
+			return accountErr
 		}
 		mapped := mapFlexReport(report, c.accountID, c.config.BaseCurrency)
 		for index := range mapped.Activities {

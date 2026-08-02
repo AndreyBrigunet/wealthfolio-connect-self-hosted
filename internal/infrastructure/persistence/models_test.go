@@ -1,8 +1,14 @@
 package persistence
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/brokerage"
 )
@@ -17,6 +23,34 @@ func TestNewMigratorAndModels(t *testing.T) {
 		if mdl == nil {
 			t.Errorf("models[%d] is nil", i)
 		}
+	}
+}
+
+func TestMigratorRepairsPersistedIBKRFlexSemantics(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		DSN: "sqlmock_db", DriverName: "postgres", Conn: sqlDB, PreferSimpleProtocol: true,
+	}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), SkipDefaultTransaction: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectExec(`UPDATE "accounts" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE "activities" SET "fx_rate"`).WillReturnResult(sqlmock.NewResult(0, 6))
+	mock.ExpectExec(`UPDATE "activities" SET .*"subtype".*"type"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	for range 6 {
+		mock.ExpectExec(`UPDATE "activities" SET "symbol_exchange_mic"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	if err := (Migrator{}).MigrateData(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 

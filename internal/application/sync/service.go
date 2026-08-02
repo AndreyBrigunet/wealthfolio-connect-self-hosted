@@ -166,7 +166,8 @@ func (s *Service) syncOne(ctx context.Context, c domainsync.BrokerClient) error 
 		}
 		states = append(states, domainsync.ActivitySyncState{
 			AccountID: stored.ID, InitialSyncCompleted: stored.InitialTxSyncDone,
-			LastSuccessfulSync: stored.LastTxSync, NextOffset: stored.ActivitySyncOffset,
+			LastSuccessfulSync: stored.LastTxSync, FirstTransactionDate: stored.FirstTxDate,
+			NextOffset: stored.ActivitySyncOffset,
 		})
 	}
 	streamErr := paged.StreamActivities(ctx, states, s.persistActivityPage)
@@ -216,7 +217,8 @@ func (s *Service) persistActivityPage(ctx context.Context, page domainsync.Activ
 		}
 	}
 	progress := repository.ActivitySyncProgress{
-		NextOffset: page.NextOffset, FirstTransactionDate: page.FirstTransactionDate,
+		NextOffset: page.NextOffset, InitialSync: page.InitialSync,
+		FirstTransactionDate: page.FirstTransactionDate,
 	}
 	if page.Complete {
 		completedAt := time.Now().UTC()

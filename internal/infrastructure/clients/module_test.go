@@ -8,6 +8,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/rs/zerolog"
 
+	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/sync"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/clients"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/config"
 )
@@ -50,7 +51,24 @@ var _ = Describe("Client constructors", func() {
 		Expect(clients.NewFutu(cfg, zerolog.Nop()).ID()).To(Equal("futu"))
 	})
 	It("IBKR client returns slug ibkr", func() {
-		Expect(clients.NewIBKR(cfg).ID()).To(Equal("ibkr"))
+		client, err := clients.NewIBKR(cfg, zerolog.Nop())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(client.ID()).To(Equal("ibkr"))
+	})
+	It("uses standalone Flex cadence without constructing Gateway mode", func() {
+		flex := *cfg
+		flex.IBKR.AccountID = "U1234567"
+		flex.IBKR.Flex = config.IBKRFlexConfig{
+			Enabled: true, Token: "token", QueryID: "123456",
+			BaseURL:      "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService",
+			BaseCurrency: "USD", SyncInterval: 6 * time.Hour,
+			RequestTimeout: time.Second, PollInterval: time.Second, PollTimeout: 2 * time.Second,
+		}
+		client, err := clients.NewIBKR(&flex, zerolog.Nop())
+		Expect(err).NotTo(HaveOccurred())
+		scheduled, ok := client.(sync.ScheduledBrokerClient)
+		Expect(ok).To(BeTrue())
+		Expect(scheduled.SyncInterval()).To(Equal(6 * time.Hour))
 	})
 	It("OKX CEX client returns slug okx", func() {
 		Expect(clients.NewOKXCEX(cfg).ID()).To(Equal("okx"))
@@ -71,11 +89,13 @@ var _ = Describe("Client constructors", func() {
 		Expect(clients.Module).NotTo(BeNil())
 	})
 	It("omits every unconfigured direct integration", func() {
-		out := clients.NewConfiguredClients(&config.Config{}, zerolog.Nop())
+		out, err := clients.NewConfiguredClients(&config.Config{}, zerolog.Nop())
+		Expect(err).NotTo(HaveOccurred())
 		Expect(out.Clients).To(BeEmpty())
 	})
 	It("registers every fully configured direct integration", func() {
-		out := clients.NewConfiguredClients(cfg, zerolog.Nop())
+		out, err := clients.NewConfiguredClients(cfg, zerolog.Nop())
+		Expect(err).NotTo(HaveOccurred())
 		Expect(out.Clients).To(HaveLen(7))
 		ids := make([]string, 0, len(out.Clients))
 		for _, client := range out.Clients {

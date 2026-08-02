@@ -46,7 +46,7 @@ SnapTrade importer reads accounts that the operator has already connected to
 SnapTrade:
 
 - **Futu Securities** — TCP/protobuf to a local **Futu OpenD** daemon (`hurisheng/go-futu-api`)
-- **Interactive Brokers** — socket protocol to a local **IB Gateway / TWS** (`scmhub/ibapi`)
+- **Interactive Brokers** — standalone, read-only **Flex Web Service** import of closed-day balances, positions, NAV, complete activity history and FX rates; legacy IB Gateway/TWS mode remains available
 - **Interactive Brokers through SnapTrade** — signed, read-only REST import of existing SnapTrade connections
 - **Binance Spot** — REST API (`adshao/go-binance/v2`)
 - **OKX CEX** — signed v5 REST API (HMAC-SHA256)
@@ -113,7 +113,7 @@ and uses **uber-go/fx** for dependency injection.
 - **PostgreSQL 14+**
 - **Docker** (for containerised deployment)
 - **Futu OpenD** running locally — only needed if you enable the Futu integration ([download](https://www.futunn.com/en/download/openAPI))
-- **IB Gateway** or **TWS** running locally — only needed if you enable the IBKR integration
+- **IB Gateway** or **TWS** running locally — only needed for legacy IBKR socket mode; not needed when `IBKR_FLEX_ENABLED=true`
 - (Optional) **mockgen** for regenerating gomock mocks: `go install go.uber.org/mock/mockgen@latest`
 - (Optional) **golangci-lint** for linting: see [installation guide](https://golangci-lint.run/usage/install/).
 
@@ -155,9 +155,10 @@ CONNECT_API_URL=https://connect.your-domain.example          # usually the same 
 
 Then, in the Wealthfolio web UI, sign in to Connect with any email that is on
 this server's `ALLOWED_EMAILS` allow-list and any 6-digit OTP (or `STATIC_OTP`
-if configured). The session JWT and refresh token are persisted by the
-Wealthfolio backend and reused across restarts — there is no separate "seed"
-step, the OS-keyring dance only applies to the Tauri desktop build.
+if configured). The Wealthfolio backend persists the session, while this
+server signs refresh tokens with `JWT_SECRET`, so they remain valid across
+normal restarts of both containers. There is no separate "seed" step; the
+OS-keyring dance only applies to the Tauri desktop build.
 
 ---
 
@@ -168,7 +169,7 @@ step, the OS-keyring dance only applies to the Tauri desktop build.
 | Name                            | Description                                                                  |
 | ------------------------------- | ---------------------------------------------------------------------------- |
 | `DATABASE_URL`                  | PostgreSQL connection string (pgx format).                                   |
-| `JWT_SECRET`                    | HS256 signing secret for access tokens.                                      |
+| `JWT_SECRET`                    | Root signing secret for access and restart-safe refresh tokens; changing it invalidates existing sessions. |
 | `CONNECT_AUTH_PUBLISHABLE_KEY`  | Expected `apikey` header on `/auth/v1/*`.                                    |
 | `ALLOWED_EMAILS`                | Comma-separated email allow-list for the synthetic OTP login. See below.    |
 
@@ -202,18 +203,25 @@ your OpenD trading password.
 | `FUTU_TRADE_PASSWORD`| —            | The trading password ("交易密码 / 交易密码 MD5") configured in OpenD.       |
 | `FUTU_CONNECTION_ID` | `wealthfolio`| Logical connection identifier surfaced in the snapshot.                    |
 
-### Interactive Brokers (socket to local IB Gateway / TWS)
+### Interactive Brokers
+
+IBKR supports two mutually exclusive modes. Set `IBKR_FLEX_ENABLED=true` for
+the recommended standalone, read-only Flex mode; this makes no Gateway/TWS
+socket connection. Leave Flex disabled only if you intentionally want legacy
+live socket mode.
+
+#### Legacy socket mode: local IB Gateway / TWS
 
 Run **IB Gateway** (recommended) or **TWS** locally with API socket access
 enabled. Allow this server's IP in the gateway's *Trusted IPs* list.
 
 | Name              | Default     | Description                                                            |
 | ----------------- | ----------- | ---------------------------------------------------------------------- |
-| `IBKR_ENABLED`    | `false`     | Explicitly enables direct IB Gateway/TWS synchronization.              |
+| `IBKR_ENABLED`    | `false`     | Master switch for the direct IBKR integration.                         |
 | `IBKR_HOST`       | `127.0.0.1` | IB Gateway / TWS host.                                                  |
 | `IBKR_PORT`       | `4001`      | `4001` for live IB Gateway, `4002` paper, `7496` TWS, `7497` TWS paper.|
-| `IBKR_CLIENT_ID`  | `1`         | Any unique integer — must not clash with other API clients.            |
-| `IBKR_ACCOUNT_ID` | —           | Optional account filter (e.g. `U1234567`); empty pulls every account.  |
+| `IBKR_CLIENT_ID`  | `17`        | Any unique integer — must not clash with other API clients.            |
+| `IBKR_ACCOUNT_ID` | —           | Optional account filter (e.g. `U1234567`); required when Flex is enabled. |
 
 > **Operational caveats.** IB Gateway is the weakest link in any IBKR
 > integration: sessions die after ~24h of uptime, the daily reset window
@@ -232,6 +240,107 @@ enabled. Allow this server's IP in the gateway's *Trusted IPs* list.
 > - If 2FA prompts become disruptive, evaluate IBKR's *Read-only login*
 >   option, which suppresses the second factor for market-data + portfolio
 >   queries.
+
+#### Standalone IBKR Flex Web Service
+
+Flex is a complete read-only source for the IBKR account in this integration.
+It supplies the latest closed-day account NAV, per-currency cash balances, open
+positions, and activities including cash movements, trades, corporate actions,
+option events, transfers and currency conversions. When Flex is enabled the
+process neither constructs nor connects to an IB Gateway/TWS client.
+
+Flex Activity Statements update once daily after close of business, so holdings
+are end-of-day rather than intraday. Flex does not expose live buying power;
+that field remains zero. This is the only holdings-level difference from socket
+mode and does not affect portfolio positions, cash, NAV, or activity history.
+Do not enable SnapTrade for that same IBKR account unless you intentionally want
+a separate duplicate account; the SnapTrade integration remains available for
+other broker connections.
+
+Create the query in Client Portal as follows:
+
+1. Open **Performance & Reports → Flex Queries**, add an **Activity Flex
+   Query**, and give it a recognizable name such as `Wealthfolio Complete`.
+2. Select the individual account used in `IBKR_ACCOUNT_ID`. Choose **XML** as
+   the output format, date format `yyyy-MM-dd`, time format `HH:mm:ss`, and a
+   space as the date/time separator. Set Trades **Level of Detail** to
+   **Execution**.
+3. Enable **all fields** in these snapshot sections: **Cash Report**, **Net
+   Asset Value (NAV) Summary in Base**, and **Open Positions**. Open Positions
+   must use **Level of Detail: Summary**. In particular retain Account ID,
+   Currency, Ending Cash, Report Date, Total NAV, Asset Class, Symbol, Conid,
+   FIGI, Quantity, FX Rate to Base, Mark Price, Cost Basis Price and FIFO
+   Unrealized PNL.
+4. Enable **all fields** in these history/reference sections: Account
+   Information, Trades, Cash Transactions, Corporate Actions,
+   Incoming/Outgoing Trade Transfers, Transfers (ACATS, Internal), Options,
+   Exercises, Assignments and Expirations, Transaction Fees, Debit Card
+   Activity, Securities Borrowed/Lent Activity (if available), Financial
+   Instrument Information, and Currency Conversion Rate. Essential identity
+   and FX fields include Account ID, asset category, currency, symbol, conid,
+   FIGI, transaction/trade/order/execution IDs, date/time, quantity, trade
+   price, proceeds/amount, IB commission and **FX Rate to Base**. In Currency
+   Conversion Rate include report date, from currency, to currency and rate.
+5. Set the query period to **Last 365 Calendar Days** and save it. The importer
+   supplies `fd`/`td` for each request and automatically divides the requested
+   history into inclusive windows of at most 365 days, so a start date such as
+   August 2023 is backfilled across multiple requests.
+6. Copy the numeric **Query ID**. Then open **Flex Web Service Configuration**,
+   enable the service, generate a new token, choose the longest suitable expiry,
+   and copy the token once. Restrict its IP if the TrueNAS egress IP is stable.
+   Store it only in the external `.env`, never in Compose YAML or Git.
+
+The official references are the [Flex Web Service API](https://www.interactivebrokers.com/campus/ibkr-api-page/flex-web-service/),
+the [`fd`/`td` override instructions](https://ibkrguides.com/orgportal/performanceandstatements/flex3.htm),
+and the [Activity Flex Query field reference](https://www.ibkrguides.com/reportingreference/reportguide/activity%20flex%20query%20reference.htm).
+
+| Name | Default | Description |
+| ---- | ------- | ----------- |
+| `IBKR_FLEX_ENABLED` | `false` | Enables standalone Flex mode; requires the `IBKR_ENABLED=true` master switch and does not require Gateway/TWS. |
+| `IBKR_FLEX_TOKEN` | — | Secret read-only Flex Web Service token. |
+| `IBKR_FLEX_QUERY_ID` | — | Numeric Activity Flex Query ID, not the report name. |
+| `IBKR_FLEX_BASE_URL` | IBKR production endpoint | Override only for a compatible endpoint/test; non-loopback HTTP is rejected. |
+| `IBKR_FLEX_BASE_CURRENCY` | `USD` | Three-letter account base currency used to select daily rates. |
+| `IBKR_FLEX_HISTORY_START_DATE` | `2023-08-01` | Inclusive initial coverage in `DD.MM.YYYY` or `YYYY-MM-DD` form. |
+| `IBKR_FLEX_SYNC_INTERVAL_MINUTES` | `1440` | Closed-day account, holdings and history cadence; minimum 60 minutes. |
+| `IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS` | `7` | Days refetched after initial backfill; deterministic IDs make this idempotent. |
+| `IBKR_FLEX_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout. |
+| `IBKR_FLEX_POLL_INTERVAL_SECONDS` | `5` | Delay between statement-ready checks. |
+| `IBKR_FLEX_POLL_TIMEOUT_SECONDS` | `120` | Maximum wait for one generated statement. |
+
+For an individual USD account whose history begins in August 2023:
+
+```env
+IBKR_ENABLED=true
+IBKR_ACCOUNT_ID=U1234567
+IBKR_FLEX_ENABLED=true
+IBKR_FLEX_TOKEN=replace-with-new-private-token
+IBKR_FLEX_QUERY_ID=123456
+IBKR_FLEX_BASE_CURRENCY=USD
+IBKR_FLEX_HISTORY_START_DATE=2023-08-01
+IBKR_FLEX_SYNC_INTERVAL_MINUTES=1440
+IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS=7
+SNAPTRADE_ENABLED=false
+```
+
+The first successful run imports and checkpoints each 365-day window. A
+restart resumes from the last durable day offset. Later runs refetch the
+configured overlap, upsert by stable IBKR identity/fingerprint, and never log
+the token. `FX Rate to Base` is preserved per activity; if it is absent, the
+same-day Currency Conversion Rate to the configured base currency is used.
+Flex stops at the previous closed report day. Intraday executions and balance
+changes appear after IBKR finalizes the next Activity Statement.
+Outgoing report-generation calls are paced to IBKR's documented limit of one
+request per second and ten per minute; the importer uses the stricter
+ten-per-minute interval during multi-window backfills.
+
+For TrueNAS, add those values to the existing host file
+`/mnt/apps/wealthfolio-connect-config/.env`; keep the Compose `env_file` entry
+pointing there. No token needs to appear in the Compose definition. Restart
+`connect` after replacing its image with a build that contains Flex support.
+The first Flex run begins immediately, and subsequent account, holdings and
+history imports follow `IBKR_FLEX_SYNC_INTERVAL_MINUTES`.
+
 
 ### Interactive Brokers through SnapTrade
 

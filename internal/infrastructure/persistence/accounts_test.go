@@ -133,9 +133,9 @@ var _ = Describe("AccountRepository", func() {
 
 	It("persists an activity checkpoint and completion independently", func() {
 		first := now.Add(-24 * time.Hour)
-		mock.ExpectExec(rx(`UPDATE "accounts" SET`)).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`(?i)UPDATE "accounts" SET .*"initial_tx_sync_done"`).WillReturnResult(sqlmock.NewResult(0, 1))
 		Expect(repo.UpdateActivitySyncProgress(ctx, "acc", repository.ActivitySyncProgress{
-			NextOffset: 1000, FirstTransactionDate: &first,
+			NextOffset: 1000, InitialSync: true, FirstTransactionDate: &first,
 		})).To(Succeed())
 		mock.ExpectExec(rx(`UPDATE "accounts" SET`)).WillReturnResult(sqlmock.NewResult(0, 1))
 		Expect(repo.UpdateActivitySyncProgress(ctx, "acc", repository.ActivitySyncProgress{

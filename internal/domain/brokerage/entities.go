@@ -138,6 +138,8 @@ const (
 	ActivityFee              ActivityType = "FEE"
 	ActivityTax              ActivityType = "TAX"
 	ActivitySplit            ActivityType = "SPLIT"
+	ActivityCredit           ActivityType = "CREDIT"
+	ActivityAdjustment       ActivityType = "ADJUSTMENT"
 	ActivityConversion       ActivityType = "CONVERSION"
 	ActivityOptionBuy        ActivityType = "OPTION_BUY"
 	ActivityOptionSell       ActivityType = "OPTION_SELL"

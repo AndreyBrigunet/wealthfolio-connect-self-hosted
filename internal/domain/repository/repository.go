@@ -39,6 +39,7 @@ type AccountRepository interface {
 // page has been persisted successfully.
 type ActivitySyncProgress struct {
 	NextOffset           int
+	InitialSync          bool
 	FirstTransactionDate *time.Time
 	CompletedAt          *time.Time
 }

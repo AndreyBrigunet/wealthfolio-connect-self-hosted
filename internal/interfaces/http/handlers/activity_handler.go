@@ -142,13 +142,14 @@ func toOptionSymbolDTO(o brokerage.OptionSymbol) optionSymbolDTO {
 }
 
 func toActivityDTO(a brokerage.Activity) activityDTO {
+	activityType, subtype, needsReview := wealthfolioActivityMapping(a.Type, a.Subtype, a.NeedsReview)
 	dto := activityDTO{
 		ID:                  a.ID,
 		Price:               a.Price,
 		Units:               a.Units,
 		Amount:              a.Amount,
 		Currency:            toCurrencyDTO(a.Currency),
-		Type:                string(a.Type),
+		Type:                string(activityType),
 		RawType:             a.RawType,
 		Description:         a.Description,
 		TradeDate:           a.TradeDate,
@@ -160,7 +161,7 @@ func toActivityDTO(a brokerage.Activity) activityDTO {
 		ProviderType:        a.ProviderType,
 		SourceSystem:        a.SourceSystem,
 		SourceRecordID:      a.SourceRecordID,
-		NeedsReview:         a.NeedsReview,
+		NeedsReview:         needsReview,
 	}
 	if a.Symbol != nil {
 		s := toSymbolDTO(*a.Symbol)
@@ -174,8 +175,8 @@ func toActivityDTO(a brokerage.Activity) activityDTO {
 		o := toOptionSymbolDTO(*a.OptionSymbol)
 		dto.OptionSymbol = &o
 	}
-	if a.Subtype != "" {
-		s := a.Subtype
+	if subtype != "" {
+		s := subtype
 		dto.Subtype = &s
 	}
 	if a.OptionType != "" {
@@ -187,6 +188,36 @@ func toActivityDTO(a brokerage.Activity) activityDTO {
 		dto.SourceGroupID = &s
 	}
 	return dto
+}
+
+func wealthfolioActivityMapping(activityType brokerage.ActivityType, subtype string, needsReview bool) (brokerage.ActivityType, string, bool) {
+	switch activityType {
+	case brokerage.ActivityBuy, brokerage.ActivitySell, brokerage.ActivityDividend,
+		brokerage.ActivityInterest, brokerage.ActivityDeposit, brokerage.ActivityWithdrawal,
+		brokerage.ActivityTransferIn, brokerage.ActivityTransferOut, brokerage.ActivityFee,
+		brokerage.ActivityTax, brokerage.ActivitySplit, brokerage.ActivityCredit,
+		brokerage.ActivityAdjustment:
+		return activityType, subtype, needsReview
+	case brokerage.ActivityOptionBuy:
+		return brokerage.ActivityBuy, firstNonEmpty(subtype, string(activityType)), needsReview
+	case brokerage.ActivityOptionSell:
+		return brokerage.ActivitySell, firstNonEmpty(subtype, string(activityType)), needsReview
+	case brokerage.ActivityOptionExpiry, brokerage.ActivityOptionAssignment, brokerage.ActivityOptionExercise:
+		return brokerage.ActivityAdjustment, firstNonEmpty(subtype, string(activityType)), needsReview
+	case brokerage.ActivityUnknown:
+		return brokerage.ActivityUnknown, subtype, true
+	default:
+		return brokerage.ActivityUnknown, firstNonEmpty(subtype, string(activityType)), true
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // List handles paginated activity queries with optional date filters.
@@ -213,6 +244,13 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		middleware.WriteError(w, http.StatusBadRequest, "invalid_request", "INVALID_END_DATE", "end_date must be YYYY-MM-DD")
 		return
+	}
+	if endDate != nil {
+		// The broker contract defines end_date as an inclusive calendar day.
+		// Parsing it at midnight and querying with <= silently dropped every
+		// activity later on that date (notably the latest closed-day trades).
+		inclusiveEnd := endDate.AddDate(0, 0, 1).Add(-time.Nanosecond)
+		endDate = &inclusiveEnd
 	}
 
 	res, err := h.svc.List(r.Context(), appbrokerage.ActivityQuery{

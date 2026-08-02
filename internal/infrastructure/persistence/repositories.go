@@ -133,6 +133,12 @@ func (r *accountRepo) Upsert(ctx context.Context, a brokerage.Account) error {
 // safe because activities are upserted by source identity.
 func (r *accountRepo) UpdateActivitySyncProgress(ctx context.Context, accountID string, progress repository.ActivitySyncProgress) error {
 	updates := map[string]any{"activity_sync_offset": progress.NextOffset}
+	if progress.InitialSync && progress.CompletedAt == nil {
+		// A paged source may replace a previously completed history provider.
+		// Mark the import incomplete with the first durable page so a restart
+		// resumes from activity_sync_offset instead of switching to incremental.
+		updates["initial_tx_sync_done"] = false
+	}
 	if progress.FirstTransactionDate != nil {
 		updates["first_tx_date"] = gorm.Expr(
 			"CASE WHEN first_tx_date IS NULL OR first_tx_date > ? THEN ? ELSE first_tx_date END",

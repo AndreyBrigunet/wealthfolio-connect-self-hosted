@@ -41,16 +41,20 @@ type ConfiguredClientsOut struct {
 
 // NewConfiguredClients constructs the enabled direct-broker and exchange
 // clients. Missing credentials disable an integration without noisy retries.
-func NewConfiguredClients(cfg *config.Config, log zerolog.Logger) ConfiguredClientsOut {
+func NewConfiguredClients(cfg *config.Config, log zerolog.Logger) (ConfiguredClientsOut, error) {
 	if cfg == nil {
-		return ConfiguredClientsOut{}
+		return ConfiguredClientsOut{}, nil
 	}
 	configured := make([]domainsync.BrokerClient, 0, 7)
 	if cfg.Futu.Enabled {
 		configured = append(configured, NewFutu(cfg, log))
 	}
 	if cfg.IBKR.Enabled {
-		configured = append(configured, NewIBKR(cfg))
+		client, err := NewIBKR(cfg, log)
+		if err != nil {
+			return ConfiguredClientsOut{}, err
+		}
+		configured = append(configured, client)
 	}
 	if allConfigured(cfg.Crypto.BinanceAPIKey, cfg.Crypto.BinanceSecret) {
 		configured = append(configured, NewBinance(cfg))
@@ -71,7 +75,7 @@ func NewConfiguredClients(cfg *config.Config, log zerolog.Logger) ConfiguredClie
 	) {
 		configured = append(configured, NewOKXWeb3(cfg, log))
 	}
-	return ConfiguredClientsOut{Clients: configured}
+	return ConfiguredClientsOut{Clients: configured}, nil
 }
 
 func allConfigured(values ...string) bool {
@@ -116,9 +120,16 @@ func NewFutu(cfg *config.Config, log zerolog.Logger) *futu.Client {
 	return c
 }
 
-// NewIBKR builds the IBKR BrokerClient from config.
-func NewIBKR(cfg *config.Config) *ibkr.Client {
-	return ibkr.New(cfg.IBKR.Host, cfg.IBKR.Port, cfg.IBKR.ClientID, cfg.IBKR.AccountID, nil)
+// NewIBKR builds either the standalone Flex client or, for legacy deployments,
+// the live Gateway client. Enabling Flex never opens a Gateway/TWS socket.
+func NewIBKR(cfg *config.Config, log zerolog.Logger) (domainsync.BrokerClient, error) {
+	if cfg.IBKR.Flex.Enabled {
+		return ibkr.NewFlex(
+			cfg.IBKR.AccountID, cfg.IBKR.Flex,
+			log.With().Str("client", "ibkr-flex").Logger(), nil,
+		)
+	}
+	return ibkr.New(cfg.IBKR.Host, cfg.IBKR.Port, cfg.IBKR.ClientID, cfg.IBKR.AccountID, nil), nil
 }
 
 // NewBinance builds the Binance Spot BrokerClient.

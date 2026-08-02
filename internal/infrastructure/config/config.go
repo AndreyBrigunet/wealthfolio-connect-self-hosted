@@ -40,13 +40,31 @@ type FutuConfig struct {
 	RSAKeyFile    string // path to RSA private key PEM (matches OpenD's RSA_PrivateKey)
 }
 
-// IBKRConfig groups everything needed to talk to a local IB Gateway / TWS.
+// IBKRFlexConfig groups the read-only IBKR Flex Web Service settings used for
+// closed-day accounts, holdings, activity history, and foreign-exchange data.
+type IBKRFlexConfig struct {
+	Enabled            bool
+	Token              string
+	QueryID            string
+	BaseURL            string
+	BaseCurrency       string
+	HistoryStartDate   time.Time
+	SyncInterval       time.Duration
+	IncrementalOverlap time.Duration
+	RequestTimeout     time.Duration
+	PollInterval       time.Duration
+	PollTimeout        time.Duration
+}
+
+// IBKRConfig groups the master IBKR switch and the mutually exclusive Gateway
+// and standalone Flex Web Service connection settings.
 type IBKRConfig struct {
 	Enabled   bool
 	Host      string
 	Port      int    // 4001 (gateway live), 4002 (gateway paper), 7496 (TWS live), 7497 (TWS paper)
 	ClientID  int64  // any positive integer unique per connection
 	AccountID string // optional, used to filter positions when the gateway has multiple
+	Flex      IBKRFlexConfig
 }
 
 // SnapTradeConfig groups the read-only SnapTrade importer settings.
@@ -276,7 +294,11 @@ func LoadFrom(get Loader) (*Config, error) {
 		Host:      getString(get, "IBKR_HOST", "127.0.0.1"),
 		Port:      ibkrPort,
 		ClientID:  int64(ibkrClientID),
-		AccountID: getString(get, "IBKR_ACCOUNT_ID", ""),
+		AccountID: strings.TrimSpace(getString(get, "IBKR_ACCOUNT_ID", "")),
+	}
+	cfg.IBKR.Flex, err = loadIBKRFlex(get, cfg.IBKR)
+	if err != nil {
+		return nil, err
 	}
 
 	// SnapTrade (read-only access to accounts connected outside this service).
@@ -316,6 +338,115 @@ func LoadFrom(get Loader) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func loadIBKRFlex(get Loader, ibkr IBKRConfig) (IBKRFlexConfig, error) {
+	var cfg IBKRFlexConfig
+	var err error
+	cfg.Enabled, err = getBool(get, "IBKR_FLEX_ENABLED")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Token = strings.TrimSpace(getString(get, "IBKR_FLEX_TOKEN", ""))
+	cfg.QueryID = strings.TrimSpace(getString(get, "IBKR_FLEX_QUERY_ID", ""))
+	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(getString(
+		get,
+		"IBKR_FLEX_BASE_URL",
+		"https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService",
+	)), "/")
+	cfg.BaseCurrency = strings.ToUpper(strings.TrimSpace(getString(get, "IBKR_FLEX_BASE_CURRENCY", "USD")))
+	cfg.HistoryStartDate, err = parseDate(
+		getString(get, "IBKR_FLEX_HISTORY_START_DATE", "2023-08-01"),
+		"IBKR_FLEX_HISTORY_START_DATE",
+	)
+	if err != nil {
+		return cfg, err
+	}
+
+	syncMinutes, err := getInt(get, "IBKR_FLEX_SYNC_INTERVAL_MINUTES", 1440)
+	if err != nil {
+		return cfg, err
+	}
+	overlapDays, err := getInt(get, "IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS", 7)
+	if err != nil {
+		return cfg, err
+	}
+	requestSeconds, err := getInt(get, "IBKR_FLEX_REQUEST_TIMEOUT_SECONDS", 30)
+	if err != nil {
+		return cfg, err
+	}
+	pollSeconds, err := getInt(get, "IBKR_FLEX_POLL_INTERVAL_SECONDS", 5)
+	if err != nil {
+		return cfg, err
+	}
+	pollTimeoutSeconds, err := getInt(get, "IBKR_FLEX_POLL_TIMEOUT_SECONDS", 120)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SyncInterval = time.Duration(syncMinutes) * time.Minute
+	cfg.IncrementalOverlap = time.Duration(overlapDays) * 24 * time.Hour
+	cfg.RequestTimeout = time.Duration(requestSeconds) * time.Second
+	cfg.PollInterval = time.Duration(pollSeconds) * time.Second
+	cfg.PollTimeout = time.Duration(pollTimeoutSeconds) * time.Second
+
+	if err := validateIBKRFlex(&cfg, ibkr); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func validateIBKRFlex(cfg *IBKRFlexConfig, ibkr IBKRConfig) error {
+	if cfg == nil {
+		return errors.New("config: IBKR Flex configuration is nil")
+	}
+	if cfg.SyncInterval < time.Hour {
+		return errors.New("config: IBKR_FLEX_SYNC_INTERVAL_MINUTES must be at least 60")
+	}
+	if cfg.IncrementalOverlap < 0 || cfg.IncrementalOverlap > 365*24*time.Hour {
+		return errors.New("config: IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS must be between 0 and 365")
+	}
+	if cfg.RequestTimeout <= 0 || cfg.PollInterval <= 0 || cfg.PollTimeout < cfg.PollInterval {
+		return errors.New("config: IBKR Flex request and polling timeouts are invalid")
+	}
+	parsedURL, err := url.Parse(cfg.BaseURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return errors.New("config: IBKR_FLEX_BASE_URL must be an absolute URL")
+	}
+	if parsedURL.Scheme != "https" && (parsedURL.Scheme != "http" || !isLoopbackHost(parsedURL.Hostname())) {
+		return errors.New("config: IBKR_FLEX_BASE_URL must use HTTPS (HTTP is allowed only for loopback tests)")
+	}
+	if len(cfg.BaseCurrency) != 3 {
+		return errors.New("config: IBKR_FLEX_BASE_CURRENCY must be a three-letter ISO currency code")
+	}
+	for _, char := range cfg.BaseCurrency {
+		if char < 'A' || char > 'Z' {
+			return errors.New("config: IBKR_FLEX_BASE_CURRENCY must be a three-letter ISO currency code")
+		}
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	if !ibkr.Enabled {
+		return errors.New("config: IBKR_ENABLED must be true when the IBKR Flex integration is enabled")
+	}
+	if ibkr.AccountID == "" {
+		return errors.New("config: IBKR_ACCOUNT_ID is required when IBKR Flex is enabled")
+	}
+	if cfg.Token == "" {
+		return errors.New("config: IBKR_FLEX_TOKEN is required when IBKR Flex is enabled")
+	}
+	if cfg.QueryID == "" {
+		return errors.New("config: IBKR_FLEX_QUERY_ID is required when IBKR Flex is enabled")
+	}
+	for _, char := range cfg.QueryID {
+		if char < '0' || char > '9' {
+			return errors.New("config: IBKR_FLEX_QUERY_ID must contain digits only")
+		}
+	}
+	if cfg.HistoryStartDate.After(time.Now().UTC()) {
+		return errors.New("config: IBKR_FLEX_HISTORY_START_DATE cannot be in the future")
+	}
+	return nil
 }
 
 func loadSnapTrade(get Loader) (SnapTradeConfig, error) {
@@ -477,12 +608,16 @@ func validateSnapTrade(cfg *SnapTradeConfig) error {
 }
 
 func parseSnapTradeDate(raw string) (time.Time, error) {
+	return parseDate(raw, "SNAPTRADE_HISTORY_START_DATE")
+}
+
+func parseDate(raw, variable string) (time.Time, error) {
 	for _, layout := range []string{"02.01.2006", "2006-01-02"} {
 		if parsed, err := time.ParseInLocation(layout, strings.TrimSpace(raw), time.UTC); err == nil {
 			return parsed.UTC(), nil
 		}
 	}
-	return time.Time{}, errors.New("config: SNAPTRADE_HISTORY_START_DATE must use DD.MM.YYYY or YYYY-MM-DD")
+	return time.Time{}, fmt.Errorf("config: %s must use DD.MM.YYYY or YYYY-MM-DD", variable)
 }
 
 func isLoopbackHost(host string) bool {

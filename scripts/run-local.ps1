@@ -98,6 +98,13 @@ if ($snapTradeEnabled -eq "true") {
         $requiredKeys += "SNAPTRADE_USER_ID", "SNAPTRADE_USER_SECRET"
     }
 }
+$ibkrFlexEnabled = [Environment]::GetEnvironmentVariable(
+    "IBKR_FLEX_ENABLED",
+    "Process"
+)
+if ($ibkrFlexEnabled -eq "true") {
+    $requiredKeys += "IBKR_ACCOUNT_ID", "IBKR_FLEX_TOKEN", "IBKR_FLEX_QUERY_ID"
+}
 
 $missingKeys = @(foreach ($key in $requiredKeys) {
     $value = [Environment]::GetEnvironmentVariable($key, "Process")

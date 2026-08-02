@@ -48,6 +48,9 @@ var _ = Describe("Config.LoadFrom", func() {
 			Expect(cfg.IBKR.Enabled).To(BeFalse())
 			Expect(cfg.IBKR.Port).To(Equal(4001))
 			Expect(cfg.IBKR.ClientID).To(Equal(int64(17)))
+			Expect(cfg.IBKR.Flex.Enabled).To(BeFalse())
+			Expect(cfg.IBKR.Flex.BaseCurrency).To(Equal("USD"))
+			Expect(cfg.IBKR.Flex.SyncInterval).To(Equal(24 * time.Hour))
 			Expect(cfg.DefiWallets).To(BeEmpty())
 		})
 	})
@@ -215,6 +218,59 @@ var _ = Describe("Config.Load (process env)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cfg).NotTo(BeNil())
 	})
+})
+
+var _ = Describe("IBKR Flex configuration", func() {
+	base := func() map[string]string {
+		return map[string]string{
+			"DATABASE_URL": "postgres://localhost/x", "JWT_SECRET": "secret",
+			"CONNECT_AUTH_PUBLISHABLE_KEY": "publishable", "ALLOWED_EMAILS": "me@example.com",
+		}
+	}
+	enabled := func(values map[string]string) map[string]string {
+		return mergeMaps(base(), mergeMaps(map[string]string{
+			"IBKR_ENABLED": "true", "IBKR_ACCOUNT_ID": "U1234567",
+			"IBKR_FLEX_ENABLED": "true", "IBKR_FLEX_TOKEN": "token",
+			"IBKR_FLEX_QUERY_ID": "123456",
+		}, values))
+	}
+
+	It("loads the enabled history and polling settings", func() {
+		cfg, err := config.LoadFrom(mapLoader(enabled(map[string]string{
+			"IBKR_FLEX_BASE_CURRENCY": "eur", "IBKR_FLEX_HISTORY_START_DATE": "01.08.2023",
+			"IBKR_FLEX_SYNC_INTERVAL_MINUTES": "240", "IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS": "3",
+			"IBKR_FLEX_REQUEST_TIMEOUT_SECONDS": "20", "IBKR_FLEX_POLL_INTERVAL_SECONDS": "2",
+			"IBKR_FLEX_POLL_TIMEOUT_SECONDS": "60",
+		})))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.IBKR.Flex.Enabled).To(BeTrue())
+		Expect(cfg.IBKR.Flex.BaseCurrency).To(Equal("EUR"))
+		Expect(cfg.IBKR.Flex.HistoryStartDate).To(Equal(time.Date(2023, 8, 1, 0, 0, 0, 0, time.UTC)))
+		Expect(cfg.IBKR.Flex.SyncInterval).To(Equal(4 * time.Hour))
+		Expect(cfg.IBKR.Flex.IncrementalOverlap).To(Equal(72 * time.Hour))
+		Expect(cfg.IBKR.Flex.PollInterval).To(Equal(2 * time.Second))
+		Expect(cfg.IBKR.Flex.PollTimeout).To(Equal(time.Minute))
+	})
+
+	DescribeTable("rejects invalid enabled settings",
+		func(values map[string]string, message string) {
+			_, err := config.LoadFrom(mapLoader(enabled(values)))
+			Expect(err).To(MatchError(ContainSubstring(message)))
+		},
+		Entry("disabled gateway", map[string]string{"IBKR_ENABLED": "false"}, "IBKR_ENABLED"),
+		Entry("missing account", map[string]string{"IBKR_ACCOUNT_ID": ""}, "IBKR_ACCOUNT_ID"),
+		Entry("missing token", map[string]string{"IBKR_FLEX_TOKEN": ""}, "IBKR_FLEX_TOKEN"),
+		Entry("missing query", map[string]string{"IBKR_FLEX_QUERY_ID": ""}, "IBKR_FLEX_QUERY_ID"),
+		Entry("non-numeric query", map[string]string{"IBKR_FLEX_QUERY_ID": "12x"}, "digits only"),
+		Entry("short cadence", map[string]string{"IBKR_FLEX_SYNC_INTERVAL_MINUTES": "59"}, "at least 60"),
+		Entry("bad base currency", map[string]string{"IBKR_FLEX_BASE_CURRENCY": "EU"}, "three-letter"),
+		Entry("non-letter base currency", map[string]string{"IBKR_FLEX_BASE_CURRENCY": "U$D"}, "three-letter"),
+		Entry("bad date", map[string]string{"IBKR_FLEX_HISTORY_START_DATE": "2023/08/01"}, "HISTORY_START_DATE"),
+		Entry("bad URL", map[string]string{"IBKR_FLEX_BASE_URL": "http://example.com"}, "HTTPS"),
+		Entry("bad polling", map[string]string{
+			"IBKR_FLEX_POLL_INTERVAL_SECONDS": "10", "IBKR_FLEX_POLL_TIMEOUT_SECONDS": "5",
+		}, "polling timeouts"),
+	)
 })
 
 var _ = Describe("SnapTrade configuration", func() {

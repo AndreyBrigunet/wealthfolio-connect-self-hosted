@@ -28,6 +28,7 @@ type ActivitySyncState struct {
 	AccountID            string
 	InitialSyncCompleted bool
 	LastSuccessfulSync   *time.Time
+	FirstTransactionDate *time.Time
 	NextOffset           int
 }
 
@@ -36,6 +37,7 @@ type ActivityPage struct {
 	AccountID            string
 	Items                []brokerage.Activity
 	NextOffset           int
+	InitialSync          bool
 	Complete             bool
 	FirstTransactionDate *time.Time
 }

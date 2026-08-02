@@ -244,7 +244,7 @@ func (c *Client) StreamActivities(ctx context.Context, states []domainsync.Activ
 		}
 		c.log.Info().Str("account", maskIdentifier(entry.account.ID)).Str("sync_mode", mode).
 			Int("offset", offset).Msg("starting SnapTrade activity import")
-		if err := c.streamAccountActivities(ctx, state.AccountID, entry.account.ID, startDate, offset, sink); err != nil {
+		if err := c.streamAccountActivities(ctx, state.AccountID, entry.account.ID, startDate, offset, mode == "initial", sink); err != nil {
 			accountErrors = append(accountErrors, err)
 		}
 	}
@@ -256,6 +256,7 @@ func (c *Client) streamAccountActivities(
 	localAccountID, remoteAccountID string,
 	startDate time.Time,
 	offset int,
+	initial bool,
 	sink domainsync.ActivitySink,
 ) error {
 	pageNumber := offset/c.config.PageSize + 1
@@ -302,7 +303,7 @@ func (c *Client) streamAccountActivities(
 			Msg("processed SnapTrade activity page")
 		if err := sink(ctx, domainsync.ActivityPage{
 			AccountID: localAccountID, Items: mapped, NextOffset: nextOffset,
-			Complete: complete, FirstTransactionDate: firstDate,
+			InitialSync: initial, Complete: complete, FirstTransactionDate: firstDate,
 		}); err != nil {
 			return fmt.Errorf("account %s persist activities offset %d: %w", maskIdentifier(remoteAccountID), offset, err)
 		}

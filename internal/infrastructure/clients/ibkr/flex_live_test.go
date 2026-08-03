@@ -248,7 +248,7 @@ func flexAuditCashImpact(activity brokerage.Activity) float64 {
 		gross := math.Abs(activity.Units * activity.Price)
 		if activity.OptionSymbol != nil {
 			gross *= 100
-		} else if activity.Symbol != nil && activity.Symbol.Type.Code == "BOND" && amount != 0 {
+		} else if activity.Symbol != nil && activity.Symbol.Type.Code == ibkrAssetClassBond && amount != 0 {
 			gross = amount
 		} else if gross == 0 {
 			gross = amount
@@ -258,7 +258,7 @@ func flexAuditCashImpact(activity brokerage.Activity) float64 {
 		gross := math.Abs(activity.Units * activity.Price)
 		if activity.OptionSymbol != nil {
 			gross *= 100
-		} else if activity.Symbol != nil && activity.Symbol.Type.Code == "BOND" && amount != 0 {
+		} else if activity.Symbol != nil && activity.Symbol.Type.Code == ibkrAssetClassBond && amount != 0 {
 			gross = amount
 		} else if gross == 0 {
 			gross = amount

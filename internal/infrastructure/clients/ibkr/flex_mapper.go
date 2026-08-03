@@ -22,9 +22,12 @@ const (
 )
 
 const (
-	flexAssetClassOption = "OPT"
-	flexKindSecurityInfo = "securityinfo"
-	flexSubtypeFXTrade   = "FXEXCHANGE"
+	ibkrAssetClassCash         = "CASH"
+	ibkrAssetClassBond         = "BOND"
+	flexAssetClassOption       = "OPT"
+	flexAssetClassFutureOption = "FOP"
+	flexKindSecurityInfo       = "securityinfo"
+	flexSubtypeFXTrade         = "FXEXCHANGE"
 )
 
 var flexSplitPattern = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:FOR|:|/)\s*([0-9]+(?:\.[0-9]+)?)`)
@@ -275,7 +278,7 @@ func planFlexCommissions(
 			commissionCurrency = strings.ToUpper(flexAttr(record.Attrs, "currency", "currencyprimary"))
 		}
 		assetClass := strings.ToUpper(flexAttr(record.Attrs, "assetcategory", "assetclass", "sectype"))
-		if assetClass != "CASH" {
+		if assetClass != ibkrAssetClassCash {
 			fixed[commissionCurrency] += commission
 			continue
 		}
@@ -481,20 +484,21 @@ func mapFlexRecord(localAccountID, remoteAccountID string, record flexRecord, se
 	assetClass := strings.ToUpper(flexAttr(securityAttrs, "assetcategory", "assetclass", "sectype"))
 	if (activity.Type == brokerage.ActivityBuy || activity.Type == brokerage.ActivitySell) &&
 		activity.Units > 0 && activity.Amount > 0 &&
-		assetClass != flexAssetClassOption && assetClass != "FOP" && assetClass != "BOND" && assetClass != "CASH" {
+		assetClass != flexAssetClassOption && assetClass != flexAssetClassFutureOption &&
+		assetClass != ibkrAssetClassBond && assetClass != ibkrAssetClassCash {
 		// Wealthfolio reconstructs transaction-mode cash as units * price.
 		// Flex proceeds is the authoritative pre-commission cash movement and
 		// can carry more precision than the displayed tradePrice.
 		activity.Price = activity.Amount / activity.Units
 	}
 	if symbol := flexSymbol(securityAttrs); symbol != nil {
-		if assetClass == "CASH" || activity.Type == brokerage.ActivityConversion {
+		if assetClass == ibkrAssetClassCash || activity.Type == brokerage.ActivityConversion {
 			activity.CurrencySymbol = symbol
 		} else {
 			activity.Symbol = symbol
 		}
 	}
-	if assetClass == flexAssetClassOption || assetClass == "FOP" {
+	if assetClass == flexAssetClassOption || assetClass == flexAssetClassFutureOption {
 		if option := flexOptionSymbol(securityAttrs); option != nil {
 			activity.OptionSymbol = option
 			activity.Symbol = nil
@@ -548,12 +552,12 @@ func flexActivityType(kind, rawType, description string, amount, units float64, 
 	assetClass := strings.ToUpper(flexAttr(attrs, "assetcategory", "assetclass", "sectype"))
 	switch strings.ToLower(kind) {
 	case "trade":
-		if assetClass == "CASH" || strings.Contains(combined, "FOREX") || strings.Contains(combined, "FX TRADE") {
+		if assetClass == ibkrAssetClassCash || strings.Contains(combined, "FOREX") || strings.Contains(combined, "FX TRADE") {
 			return brokerage.ActivityConversion, "FX_TRADE", false
 		}
 		buy := strings.Contains(combined, "BUY") || strings.Contains(combined, "BOT")
 		sell := strings.Contains(combined, "SELL") || strings.Contains(combined, "SLD")
-		if assetClass == flexAssetClassOption || assetClass == "FOP" {
+		if assetClass == flexAssetClassOption || assetClass == flexAssetClassFutureOption {
 			if buy {
 				return brokerage.ActivityOptionBuy, "", false
 			}

@@ -15,12 +15,19 @@ import (
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/brokerage"
 )
 
-const flexInstitutionName = "Interactive Brokers"
+const (
+	flexInstitutionName = "Interactive Brokers"
+	flexLogoURL         = "https://passiv-brokerage-logos.s3.ca-central-1.amazonaws.com/interactive-brokers-logo.png"
+	flexSquareLogoURL   = "https://passiv-brokerage-logos.s3.ca-central-1.amazonaws.com/interactive-brokers-logo-square.png"
+)
 
 const (
-	flexAssetClassOption = "OPT"
-	flexKindSecurityInfo = "securityinfo"
-	flexSubtypeFXTrade   = "FXEXCHANGE"
+	ibkrAssetClassCash         = "CASH"
+	ibkrAssetClassBond         = "BOND"
+	flexAssetClassOption       = "OPT"
+	flexAssetClassFutureOption = "FOP"
+	flexKindSecurityInfo       = "securityinfo"
+	flexSubtypeFXTrade         = "FXEXCHANGE"
 )
 
 var flexSplitPattern = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:FOR|:|/)\s*([0-9]+(?:\.[0-9]+)?)`)
@@ -45,6 +52,20 @@ type flexMappingResult struct {
 	Review     int
 }
 
+type flexCommissionPlan struct {
+	Currency string
+	Amount   float64
+}
+
+type flexCommissionCandidate struct {
+	Fingerprint      string
+	DeclaredCurrency string
+	OutCurrency      string
+	DeclaredAmount   float64
+	OutAmount        float64
+	UseOutCurrency   bool
+}
+
 func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flexMappingResult {
 	securities := make(map[string]map[string]string)
 	rates := make(map[flexRateKey]float64)
@@ -58,6 +79,7 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 			indexFlexRate(rates, record.Attrs, baseCurrency)
 		}
 	}
+	commissionPlans := planFlexCommissions(report, rates, remoteAccountID, baseCurrency)
 
 	localAccountID := "ibkr-" + remoteAccountID
 	result := flexMappingResult{}
@@ -76,7 +98,7 @@ func mapFlexReport(report flexReport, remoteAccountID, baseCurrency string) flex
 		}
 		activities := []brokerage.Activity{activity}
 		if activity.Type == brokerage.ActivityConversion {
-			activities = expandFlexConversion(activity, record)
+			activities = expandFlexConversionWithCommission(activity, record, commissionPlans[activity.SourceFingerprint])
 		}
 		for _, mapped := range activities {
 			switch {
@@ -123,6 +145,14 @@ func isFlexNativeCurrencyTrade(activityType brokerage.ActivityType) bool {
 }
 
 func expandFlexConversion(activity brokerage.Activity, record flexRecord) []brokerage.Activity {
+	return expandFlexConversionWithCommission(activity, record, flexCommissionPlan{})
+}
+
+func expandFlexConversionWithCommission(
+	activity brokerage.Activity,
+	record flexRecord,
+	commissionPlan flexCommissionPlan,
+) []brokerage.Activity {
 	baseCurrency, quoteCurrency, ok := flexCurrencyPair(record.Attrs)
 	baseAmount := math.Abs(activity.Units)
 	quoteAmount := math.Abs(activity.Amount)
@@ -189,26 +219,177 @@ func expandFlexConversion(activity brokerage.Activity, record flexRecord) []brok
 		commissionCurrency = quoteCurrency
 	}
 	if activity.Fee > 0 {
-		commission := activity.Fee
-		if commissionCurrency != outCurrency {
-			rate := math.Abs(activity.Price)
-			switch {
-			case commissionCurrency == quoteCurrency && outCurrency == baseCurrency && rate > 0:
-				// Flex reports the commission in quote currency, while IBKR's
-				// cash ledger charges the currency being sold.
-				commission /= rate
-			case commissionCurrency == baseCurrency && outCurrency == quoteCurrency && rate > 0:
-				commission *= rate
-			default:
-				feeLeg := makeLeg("fee", brokerage.ActivityFee, commissionCurrency, activity.Fee)
-				feeLeg.Subtype = "FX_COMMISSION"
-				feeLeg.SourceGroupID = ""
-				return []brokerage.Activity{outLeg, inLeg, feeLeg}
-			}
+		commissionAmount := activity.Fee
+		if commissionPlan.Currency != "" && commissionPlan.Amount > 0 {
+			commissionCurrency = commissionPlan.Currency
+			commissionAmount = commissionPlan.Amount
 		}
-		outLeg.Fee = commission
+		if commissionCurrency == outCurrency {
+			outLeg.Fee = commissionAmount
+		} else {
+			// Keep a commission charged in another currency as its own cash
+			// movement instead of attaching it to the outgoing FX leg.
+			feeLeg := makeLeg("fee", brokerage.ActivityFee, commissionCurrency, commissionAmount)
+			feeLeg.Subtype = "FX_COMMISSION"
+			feeLeg.SourceGroupID = ""
+			return []brokerage.Activity{outLeg, inLeg, feeLeg}
+		}
 	}
 	return []brokerage.Activity{outLeg, inLeg}
+}
+
+func planFlexCommissions(
+	report flexReport,
+	rates map[flexRateKey]float64,
+	accountID, baseCurrency string,
+) map[string]flexCommissionPlan {
+	// Historical Flex statements can express an FX commission in the current
+	// base currency even when the cash ledger charged the currency sold. The
+	// per-currency Cash Report is authoritative for both allocation and totals.
+	targets := make(map[string]float64)
+	targetAvailable := make(map[string]bool)
+	for _, record := range report.Records {
+		if !strings.EqualFold(record.Kind, "CashReportCurrency") {
+			continue
+		}
+		currency := strings.ToUpper(flexAttr(record.Attrs, "currency"))
+		if currency == "" || currency == flexBaseSummaryCurrency {
+			continue
+		}
+		if commission, ok := flexFloat(record.Attrs, "commissions"); ok {
+			targets[currency] = math.Abs(commission)
+			targetAvailable[currency] = true
+		}
+	}
+
+	fixed := make(map[string]float64)
+	candidates := make([]flexCommissionCandidate, 0)
+	for _, record := range report.Records {
+		if !strings.EqualFold(record.Kind, "Trade") {
+			continue
+		}
+		commission, ok := flexFloat(record.Attrs, "ibcommission", "commission", "fee", "commtax")
+		commission = math.Abs(commission)
+		if !ok || commission == 0 {
+			continue
+		}
+		commissionCurrency := strings.ToUpper(flexAttr(record.Attrs, "ibcommissioncurrency", "commissioncurrency"))
+		if commissionCurrency == "" {
+			commissionCurrency = strings.ToUpper(flexAttr(record.Attrs, "currency", "currencyprimary"))
+		}
+		assetClass := strings.ToUpper(flexAttr(record.Attrs, "assetcategory", "assetclass", "sectype"))
+		if assetClass != ibkrAssetClassCash {
+			fixed[commissionCurrency] += commission
+			continue
+		}
+
+		base, quote, validPair := flexCurrencyPair(record.Attrs)
+		side := strings.ToUpper(flexAttr(record.Attrs, "buysell", "direction"))
+		buyBase := strings.Contains(side, "BUY") || strings.Contains(side, "BOT")
+		sellBase := strings.Contains(side, "SELL") || strings.Contains(side, "SLD")
+		if !validPair || buyBase == sellBase {
+			fixed[commissionCurrency] += commission
+			continue
+		}
+		outCurrency := base
+		if buyBase {
+			outCurrency = quote
+		}
+		if outCurrency == commissionCurrency {
+			fixed[outCurrency] += commission
+			continue
+		}
+
+		outAmount, converted := convertFlexAmount(
+			commission, commissionCurrency, outCurrency, flexDate(record.Attrs), rates, baseCurrency,
+		)
+		candidate := flexCommissionCandidate{
+			Fingerprint:      flexFingerprint(accountID, record),
+			DeclaredCurrency: commissionCurrency,
+			OutCurrency:      outCurrency,
+			DeclaredAmount:   commission,
+			OutAmount:        outAmount,
+			// A converted legacy commission carries sub-cent base-currency
+			// precision. A fee actually charged in the declared currency keeps
+			// ordinary currency precision (for example, exactly USD 2.00).
+			UseOutCurrency: converted && !isFlexMinorUnitAmount(commission),
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	selectedTotals := make(map[string]float64)
+	for _, candidate := range candidates {
+		currency := candidate.DeclaredCurrency
+		amount := candidate.DeclaredAmount
+		if candidate.UseOutCurrency {
+			currency = candidate.OutCurrency
+			amount = candidate.OutAmount
+		}
+		selectedTotals[currency] += amount
+	}
+
+	scales := make(map[string]float64)
+	for currency, selected := range selectedTotals {
+		if selected == 0 || !targetAvailable[currency] {
+			continue
+		}
+		desired := targets[currency] - fixed[currency]
+		if desired < 0 {
+			continue
+		}
+		ratio := desired / selected
+		// Small differences come from the daily translation rate used by the
+		// statement. Refuse a large correction so missing query fields or an
+		// unexpected report shape cannot silently rewrite trade fees.
+		if ratio >= 0.9 && ratio <= 1.1 {
+			scales[currency] = ratio
+		}
+	}
+
+	plans := make(map[string]flexCommissionPlan, len(candidates))
+	for _, candidate := range candidates {
+		plan := flexCommissionPlan{Currency: candidate.DeclaredCurrency, Amount: candidate.DeclaredAmount}
+		if candidate.UseOutCurrency {
+			plan.Currency = candidate.OutCurrency
+			plan.Amount = candidate.OutAmount
+		}
+		if scale, ok := scales[plan.Currency]; ok {
+			plan.Amount *= scale
+		}
+		plans[candidate.Fingerprint] = plan
+	}
+	return plans
+}
+
+func convertFlexAmount(
+	amount float64,
+	fromCurrency, toCurrency string,
+	date time.Time,
+	rates map[flexRateKey]float64,
+	baseCurrency string,
+) (float64, bool) {
+	fromRate, fromOK := flexRateForCurrency(rates, date, fromCurrency, baseCurrency)
+	toRate, toOK := flexRateForCurrency(rates, date, toCurrency, baseCurrency)
+	if !fromOK || !toOK || fromRate <= 0 || toRate <= 0 {
+		return 0, false
+	}
+	return amount * fromRate / toRate, true
+}
+
+func flexRateForCurrency(
+	rates map[flexRateKey]float64,
+	date time.Time,
+	currency, baseCurrency string,
+) (float64, bool) {
+	if strings.EqualFold(currency, baseCurrency) {
+		return 1, true
+	}
+	rate, ok := rates[flexRateKey{Date: date.UTC().Format("2006-01-02"), Currency: strings.ToUpper(currency)}]
+	return rate, ok
+}
+
+func isFlexMinorUnitAmount(amount float64) bool {
+	return math.Abs(amount*100-math.Round(amount*100)) < 1e-7
 }
 
 func flexCurrencyPair(attrs map[string]string) (baseCurrency, quoteCurrency string, ok bool) {
@@ -301,14 +482,23 @@ func mapFlexRecord(localAccountID, remoteAccountID string, record flexRecord, se
 		securityAttrs = mergeFlexAttrs(info, record.Attrs)
 	}
 	assetClass := strings.ToUpper(flexAttr(securityAttrs, "assetcategory", "assetclass", "sectype"))
+	if (activity.Type == brokerage.ActivityBuy || activity.Type == brokerage.ActivitySell) &&
+		activity.Units > 0 && activity.Amount > 0 &&
+		assetClass != flexAssetClassOption && assetClass != flexAssetClassFutureOption &&
+		assetClass != ibkrAssetClassBond && assetClass != ibkrAssetClassCash {
+		// Wealthfolio reconstructs transaction-mode cash as units * price.
+		// Flex proceeds is the authoritative pre-commission cash movement and
+		// can carry more precision than the displayed tradePrice.
+		activity.Price = activity.Amount / activity.Units
+	}
 	if symbol := flexSymbol(securityAttrs); symbol != nil {
-		if assetClass == "CASH" || activity.Type == brokerage.ActivityConversion {
+		if assetClass == ibkrAssetClassCash || activity.Type == brokerage.ActivityConversion {
 			activity.CurrencySymbol = symbol
 		} else {
 			activity.Symbol = symbol
 		}
 	}
-	if assetClass == flexAssetClassOption || assetClass == "FOP" {
+	if assetClass == flexAssetClassOption || assetClass == flexAssetClassFutureOption {
 		if option := flexOptionSymbol(securityAttrs); option != nil {
 			activity.OptionSymbol = option
 			activity.Symbol = nil
@@ -362,12 +552,12 @@ func flexActivityType(kind, rawType, description string, amount, units float64, 
 	assetClass := strings.ToUpper(flexAttr(attrs, "assetcategory", "assetclass", "sectype"))
 	switch strings.ToLower(kind) {
 	case "trade":
-		if assetClass == "CASH" || strings.Contains(combined, "FOREX") || strings.Contains(combined, "FX TRADE") {
+		if assetClass == ibkrAssetClassCash || strings.Contains(combined, "FOREX") || strings.Contains(combined, "FX TRADE") {
 			return brokerage.ActivityConversion, "FX_TRADE", false
 		}
 		buy := strings.Contains(combined, "BUY") || strings.Contains(combined, "BOT")
 		sell := strings.Contains(combined, "SELL") || strings.Contains(combined, "SLD")
-		if assetClass == flexAssetClassOption || assetClass == "FOP" {
+		if assetClass == flexAssetClassOption || assetClass == flexAssetClassFutureOption {
 			if buy {
 				return brokerage.ActivityOptionBuy, "", false
 			}
@@ -382,9 +572,20 @@ func flexActivityType(kind, rawType, description string, amount, units float64, 
 			return brokerage.ActivitySell, "", false
 		}
 	case "cashtransaction":
+		detailType := strings.ToUpper(rawType)
 		detail := strings.ToUpper(description)
 		switch {
+		case strings.Contains(detailType, "DIVIDEND") || strings.Contains(detailType, "PAYMENT IN LIEU"):
+			return brokerage.ActivityDividend, "", false
+		case strings.Contains(detailType, "WITHHOLD") || strings.Contains(detailType, "TAX"):
+			if amount > 0 {
+				return brokerage.ActivityCredit, "REFUND", false
+			}
+			return brokerage.ActivityTax, "", false
 		case strings.Contains(combined, "WITHHOLD") || strings.Contains(combined, "TAX"):
+			if amount > 0 {
+				return brokerage.ActivityCredit, "REFUND", false
+			}
 			return brokerage.ActivityTax, "", false
 		case strings.Contains(combined, "DIVIDEND") || strings.Contains(combined, "PAYMENT IN LIEU"):
 			return brokerage.ActivityDividend, "", false

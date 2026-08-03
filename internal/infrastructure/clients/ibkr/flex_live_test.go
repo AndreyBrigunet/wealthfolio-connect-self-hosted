@@ -2,6 +2,8 @@ package ibkr
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/brokerage"
 	domainsync "github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/sync"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/config"
 )
@@ -60,7 +63,8 @@ func TestFlexLiveSnapshotFallback(t *testing.T) {
 }
 
 // TestFlexLiveAudit is an explicit, opt-in diagnostic. It never prints
-// credentials, account numbers, symbols, amounts, or raw statement rows.
+// credentials, account numbers, symbols, or raw statement rows. It does print
+// aggregated cash totals so transaction-mode cash can be reconciled safely.
 func TestFlexLiveAudit(t *testing.T) {
 	if os.Getenv("IBKR_FLEX_LIVE_AUDIT") != "1" {
 		t.Skip("set IBKR_FLEX_LIVE_AUDIT=1 to audit the configured live Flex query")
@@ -69,25 +73,29 @@ func TestFlexLiveAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api, err := newFlexAPI(
-		cfg.IBKR.Flex.BaseURL, cfg.IBKR.Flex.Token, cfg.IBKR.Flex.QueryID, nil,
-		cfg.IBKR.Flex.RequestTimeout, cfg.IBKR.Flex.PollInterval, cfg.IBKR.Flex.PollTimeout,
-	)
+	client, err := NewFlex(cfg.IBKR.AccountID, cfg.IBKR.Flex, zerolog.Nop(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	liveSnapshot, err := client.FetchAccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	from := beginningOfUTCDay(cfg.IBKR.Flex.HistoryStartDate)
-	through := beginningOfUTCDay(time.Now().UTC()).AddDate(0, 0, -1)
+	through := client.latestReportDay()
 	recordCounts := make(map[string]int)
 	activityCounts := make(map[string]int)
 	elements := make(map[string]int)
 	attributedElements := make(map[string]int)
 	fieldNames := make(map[string]map[string]struct{})
+	openingCash := make(map[string]float64)
+	statementCash := make(map[string]float64)
+	mappedCashChange := make(map[string]float64)
+	mappedCashByType := make(map[string]map[string]float64)
+	mappedCashDetails := make(map[string]map[string]flexAuditActivityTotals)
 	totalMapped, totalSkipped, totalReview, missingFX, fingerprintIDs := 0, 0, 0, 0, 0
 	var firstActivity, lastActivity *time.Time
-	var latestReport flexReport
 	windows := 0
 
 	for !from.After(through) {
@@ -95,7 +103,7 @@ func TestFlexLiveAudit(t *testing.T) {
 		if to.After(through) {
 			to = through
 		}
-		report, fetchErr := api.fetch(ctx, from, to)
+		report, fetchErr := client.api.fetch(ctx, from, to)
 		if fetchErr != nil {
 			t.Fatalf("Flex window %s..%s: %v", from.Format("2006-01-02"), to.Format("2006-01-02"), fetchErr)
 		}
@@ -103,7 +111,6 @@ func TestFlexLiveAudit(t *testing.T) {
 			t.Fatal(accountErr)
 		}
 		mapped := mapFlexReport(report, cfg.IBKR.AccountID, cfg.IBKR.Flex.BaseCurrency)
-		latestReport = report
 		windows++
 		t.Logf("WINDOW %s..%s records=%d mapped=%d skipped=%d review=%d",
 			from.Format("2006-01-02"), to.Format("2006-01-02"),
@@ -119,6 +126,21 @@ func TestFlexLiveAudit(t *testing.T) {
 		}
 		for _, record := range report.Records {
 			recordCounts[record.Kind]++
+			if strings.EqualFold(record.Kind, "CashReportCurrency") {
+				currency := strings.ToUpper(flexAttr(record.Attrs, "currency"))
+				if currency != "" && currency != flexBaseSummaryCurrency {
+					t.Logf("CASH_REPORT window=%s..%s %s", from.Format("2006-01-02"),
+						to.Format("2006-01-02"), formatCashAuditAttrs(record.Attrs))
+					if _, exists := openingCash[currency]; !exists {
+						if value, ok := flexFloat(record.Attrs, "startingcash", "beginningcash"); ok {
+							openingCash[currency] = value
+						}
+					}
+					if value, ok := flexFloat(record.Attrs, "endingcash"); ok {
+						statementCash[currency] = value
+					}
+				}
+			}
 			if fieldNames[record.Kind] == nil {
 				fieldNames[record.Kind] = make(map[string]struct{})
 			}
@@ -128,6 +150,23 @@ func TestFlexLiveAudit(t *testing.T) {
 		}
 		for _, activity := range mapped.Activities {
 			activityCounts[string(activity.Type)]++
+			currency := strings.ToUpper(activity.Currency.Code)
+			impact := flexAuditCashImpact(activity)
+			mappedCashChange[currency] += impact
+			if mappedCashByType[currency] == nil {
+				mappedCashByType[currency] = make(map[string]float64)
+			}
+			mappedCashByType[currency][string(activity.Type)] += impact
+			if mappedCashDetails[currency] == nil {
+				mappedCashDetails[currency] = make(map[string]flexAuditActivityTotals)
+			}
+			detailKey := strings.Join([]string{string(activity.Type), activity.Subtype, activity.RawType}, "/")
+			detail := mappedCashDetails[currency][detailKey]
+			detail.Count++
+			detail.Amount += math.Abs(activity.Amount)
+			detail.Fee += math.Abs(activity.Fee)
+			detail.Impact += impact
+			mappedCashDetails[currency][detailKey] = detail
 			if activity.FxRate == nil && !isFlexNativeCurrencyTrade(activity.Type) && activity.Currency.Code != "" &&
 				!strings.EqualFold(activity.Currency.Code, cfg.IBKR.Flex.BaseCurrency) {
 				missingFX++
@@ -157,18 +196,23 @@ func TestFlexLiveAudit(t *testing.T) {
 	t.Logf("ACTIVITY_TYPES %s", formatAuditCounts(activityCounts))
 	t.Logf("XML_ELEMENTS %s", formatAuditCounts(elements))
 	t.Logf("ATTRIBUTED_XML_TAGS %s", formatAuditCounts(attributedElements))
-	if sectionErr := validateFlexSnapshotSections(latestReport); sectionErr != nil {
-		t.Error(sectionErr)
-	} else {
-		snapshot, snapshotErr := mapFlexSnapshot(
-			latestReport, cfg.IBKR.AccountID, cfg.IBKR.Flex.BaseCurrency, time.Now().UTC(),
-		)
-		if snapshotErr != nil {
-			t.Error(snapshotErr)
-		} else {
-			t.Logf("SNAPSHOT accounts=%d balances=%d positions=%d option_positions=%d",
-				len(snapshot.Accounts), len(snapshot.Holdings[0].Balances),
-				len(snapshot.Holdings[0].Positions), len(snapshot.Holdings[0].OptionPositions))
+	t.Logf("SNAPSHOT report_day=%s accounts=%d balances=%d positions=%d option_positions=%d",
+		through.Format("2006-01-02"), len(liveSnapshot.Accounts), len(liveSnapshot.Holdings[0].Balances),
+		len(liveSnapshot.Holdings[0].Positions), len(liveSnapshot.Holdings[0].OptionPositions))
+	for _, currency := range sortedFloatKeys(statementCash) {
+		reconstructed := openingCash[currency] + mappedCashChange[currency]
+		delta := statementCash[currency] - reconstructed
+		t.Logf("CASH_RECONCILIATION currency=%s opening=%.8f mapped_change=%.8f reconstructed=%.8f statement_ending=%.8f delta=%.8f",
+			currency, openingCash[currency], mappedCashChange[currency], reconstructed,
+			statementCash[currency], delta)
+		if math.Abs(delta) > 0.01 {
+			t.Errorf("cash reconciliation for %s differs by %.8f", currency, delta)
+		}
+		t.Logf("CASH_IMPACT currency=%s %s", currency, formatAuditFloatCounts(mappedCashByType[currency]))
+		for _, detailKey := range sortedActivityTotalKeys(mappedCashDetails[currency]) {
+			detail := mappedCashDetails[currency][detailKey]
+			t.Logf("CASH_ACTIVITY currency=%s mapping=%s count=%d amount=%.8f fee=%.8f impact=%.8f",
+				currency, detailKey, detail.Count, detail.Amount, detail.Fee, detail.Impact)
 		}
 	}
 	for _, kind := range sortedAuditKeys(fieldNames) {
@@ -177,6 +221,108 @@ func TestFlexLiveAudit(t *testing.T) {
 			t.Logf("MISSING_QUERY_FIELDS %s: %s", kind, strings.Join(missing, ", "))
 		}
 	}
+}
+
+type flexAuditActivityTotals struct {
+	Count  int
+	Amount float64
+	Fee    float64
+	Impact float64
+}
+
+func sortedActivityTotalKeys(values map[string]flexAuditActivityTotals) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func flexAuditCashImpact(activity brokerage.Activity) float64 {
+	amount := math.Abs(activity.Amount)
+	fee := math.Abs(activity.Fee)
+	assetTransfer := activity.Symbol != nil || activity.OptionSymbol != nil
+	switch activity.Type {
+	case brokerage.ActivityBuy, brokerage.ActivityOptionBuy:
+		gross := math.Abs(activity.Units * activity.Price)
+		if activity.OptionSymbol != nil {
+			gross *= 100
+		} else if activity.Symbol != nil && activity.Symbol.Type.Code == ibkrAssetClassBond && amount != 0 {
+			gross = amount
+		} else if gross == 0 {
+			gross = amount
+		}
+		return -(gross + fee)
+	case brokerage.ActivitySell, brokerage.ActivityOptionSell:
+		gross := math.Abs(activity.Units * activity.Price)
+		if activity.OptionSymbol != nil {
+			gross *= 100
+		} else if activity.Symbol != nil && activity.Symbol.Type.Code == ibkrAssetClassBond && amount != 0 {
+			gross = amount
+		} else if gross == 0 {
+			gross = amount
+		}
+		return gross - fee
+	case brokerage.ActivityDeposit, brokerage.ActivityDividend, brokerage.ActivityInterest, brokerage.ActivityCredit:
+		return amount - fee
+	case brokerage.ActivityWithdrawal:
+		return -(amount + fee)
+	case brokerage.ActivityTransferIn:
+		if assetTransfer {
+			return -fee
+		}
+		return amount - fee
+	case brokerage.ActivityTransferOut:
+		if assetTransfer {
+			return -fee
+		}
+		return -(amount + fee)
+	case brokerage.ActivityFee, brokerage.ActivityTax:
+		if fee != 0 {
+			return -fee
+		}
+		return -amount
+	default:
+		return 0
+	}
+}
+
+func sortedFloatKeys(values map[string]float64) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func formatAuditFloatCounts(values map[string]float64) string {
+	keys := sortedFloatKeys(values)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%.8f", key, values[key]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatCashAuditAttrs(attrs map[string]string) string {
+	keys := make([]string, 0, len(attrs))
+	for key := range attrs {
+		if key != "accountid" && key != "account" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := attrs[key]
+		if parsed, err := strconv.ParseFloat(strings.ReplaceAll(value, ",", ""), 64); err == nil && parsed == 0 {
+			continue
+		}
+		parts = append(parts, key+"="+value)
+	}
+	return strings.Join(parts, " ")
 }
 
 func missingFlexFields(kind string, fields map[string]struct{}) []string {

@@ -93,7 +93,7 @@ func mapFlexSnapshot(report flexReport, remoteAccountID, baseCurrency string, ca
 		assetClass := strings.ToUpper(flexAttr(attrs, "assetcategory", "assetclass", "sectype"))
 		markPrice, _ := flexFloat(record.Attrs, "markprice", "closeprice", "price")
 		averagePrice, _ := flexFloat(record.Attrs, "costbasisprice", "openprice")
-		if assetClass == flexAssetClassOption || assetClass == "FOP" {
+		if assetClass == flexAssetClassOption || assetClass == flexAssetClassFutureOption {
 			option := flexOptionSymbol(attrs)
 			if option == nil {
 				return domainsync.BrokerSnapshot{}, fmt.Errorf("ibkr flex: open option position omitted contract fields for conid %s", maskFlexIdentifier(flexAttr(attrs, "conid")))
@@ -126,6 +126,7 @@ func mapFlexSnapshot(report flexReport, remoteAccountID, baseCurrency string, ca
 	connection := brokerage.Connection{
 		ID: "ibkr-conn", AuthorizationID: "ibkr-auth", BrokerageName: flexInstitutionName,
 		BrokerageSlug: "ibkr", DisplayName: flexInstitutionName, Name: "IBKR",
+		LogoURL: flexLogoURL, SquareLogoURL: flexSquareLogoURL,
 		Status: brokerage.ConnectionActive, UpdatedAt: capturedAt.UTC(),
 	}
 	account := brokerage.Account{

@@ -79,6 +79,9 @@ func TestFlexClientMapsHistoryAndDailyFX(t *testing.T) {
 	if len(snapshot.Accounts) != 1 || snapshot.Accounts[0].BalanceTotal != 1234.50 || snapshot.Accounts[0].InitialTxSyncDone {
 		t.Fatalf("Flex account snapshot = %#v", snapshot.Accounts)
 	}
+	if snapshot.Connection.LogoURL != flexLogoURL || snapshot.Connection.SquareLogoURL != flexSquareLogoURL {
+		t.Fatalf("Flex connection logos = %#v", snapshot.Connection)
+	}
 	if len(snapshot.Holdings) != 1 || len(snapshot.Holdings[0].Balances) != 2 || len(snapshot.Holdings[0].Positions) != 1 {
 		t.Fatalf("Flex holdings snapshot = %#v", snapshot.Holdings)
 	}
@@ -265,6 +268,31 @@ func TestMapFlexReportDoesNotTranslateSecurityTradeCashToBaseCurrency(t *testing
 	}
 }
 
+func TestMapFlexReportUsesSecurityProceedsForEffectiveCashPrice(t *testing.T) {
+	report := flexReport{
+		Accounts: map[string]struct{}{"U1234567": {}},
+		Records: []flexRecord{
+			{Kind: "SecurityInfo", Attrs: map[string]string{
+				"conid": "77", "symbol": "ABC", "assetcategory": "STK", "currency": "EUR",
+			}},
+			{Kind: "Trade", Attrs: map[string]string{
+				"accountid": "U1234567", "conid": "77", "assetcategory": "STK", "currency": "EUR",
+				"tradedate": "20240102", "buysell": "BUY", "quantity": "3", "tradeprice": "10",
+				"proceeds": "-30.01", "ibexecid": "buy",
+			}},
+		},
+	}
+
+	mapped := mapFlexReport(report, "U1234567", "USD")
+	if len(mapped.Activities) != 1 {
+		t.Fatalf("mapped activities = %#v", mapped.Activities)
+	}
+	activity := mapped.Activities[0]
+	if math.Abs(activity.Units*activity.Price-30.01) > 1e-12 {
+		t.Fatalf("effective cash price = %#v", activity)
+	}
+}
+
 func TestExpandFlexConversionMapsSellAndMalformedRecords(t *testing.T) {
 	base := brokerage.Activity{
 		ID: "activity", Type: brokerage.ActivityConversion, TradeDate: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
@@ -274,12 +302,16 @@ func TestExpandFlexConversionMapsSellAndMalformedRecords(t *testing.T) {
 	sell := expandFlexConversion(base, flexRecord{Attrs: map[string]string{
 		"symbol": "EUR.USD", "currency": "USD", "buysell": "SELL", "ibcommissioncurrency": "USD",
 	}})
-	if len(sell) != 2 || sell[0].Type != brokerage.ActivityTransferOut || sell[0].Currency.Code != "EUR" ||
-		sell[0].Amount != 25 || math.Abs(sell[0].Fee-(0.25/1.1)) > 1e-12 {
+	if len(sell) != 3 || sell[0].Type != brokerage.ActivityTransferOut || sell[0].Currency.Code != "EUR" ||
+		sell[0].Amount != 25 || sell[0].Fee != 0 {
 		t.Fatalf("sell out leg = %#v", sell)
 	}
 	if sell[1].Type != brokerage.ActivityTransferIn || sell[1].Currency.Code != "USD" || sell[1].Amount != 27.5 || sell[1].Fee != 0 {
 		t.Fatalf("sell in leg = %#v", sell)
+	}
+	if sell[2].Type != brokerage.ActivityFee || sell[2].Subtype != "FX_COMMISSION" ||
+		sell[2].Currency.Code != "USD" || sell[2].Amount != 0.25 || sell[2].Fee != 0 {
+		t.Fatalf("sell fee leg = %#v", sell)
 	}
 
 	malformed := expandFlexConversion(base, flexRecord{Attrs: map[string]string{
@@ -287,6 +319,91 @@ func TestExpandFlexConversionMapsSellAndMalformedRecords(t *testing.T) {
 	}})
 	if len(malformed) != 1 || malformed[0].Type != brokerage.ActivityUnknown || !malformed[0].NeedsReview {
 		t.Fatalf("malformed conversion = %#v", malformed)
+	}
+}
+
+func TestMapFlexReportReconcilesFXCommissionsWithCashReportCurrencies(t *testing.T) {
+	report := flexReport{
+		Accounts: map[string]struct{}{"U1234567": {}},
+		Records: []flexRecord{
+			{Kind: "ConversionRate", Attrs: map[string]string{
+				"reportdate": "2024-08-20", "fromcurrency": "EUR", "tocurrency": "USD", "rate": "1.113",
+			}},
+			{Kind: "Trade", Attrs: map[string]string{
+				"accountid": "U1234567", "assetcategory": "CASH", "symbol": "EUR.USD", "currency": "USD",
+				"tradedate": "20240820", "buysell": "SELL", "quantity": "-200", "tradeprice": "1.10",
+				"proceeds": "220", "ibcommission": "-2.00803008", "ibcommissioncurrency": "USD", "ibexecid": "fx-eur-fee",
+			}},
+			{Kind: "Trade", Attrs: map[string]string{
+				"accountid": "U1234567", "assetcategory": "CASH", "symbol": "EUR.USD", "currency": "USD",
+				"tradedate": "20250318", "buysell": "SELL", "quantity": "-400", "tradeprice": "1.09",
+				"proceeds": "436", "ibcommission": "-2.00", "ibcommissioncurrency": "USD", "ibexecid": "fx-usd-fee",
+			}},
+			{Kind: "CashReportCurrency", Attrs: map[string]string{
+				"accountid": "U1234567", "currency": "EUR", "fromdate": "20240820", "todate": "20250318",
+				"commissions": "-1.80416",
+			}},
+			{Kind: "CashReportCurrency", Attrs: map[string]string{
+				"accountid": "U1234567", "currency": "USD", "fromdate": "20240820", "todate": "20250318",
+				"commissions": "-2.00",
+			}},
+		},
+	}
+
+	mapped := mapFlexReport(report, "U1234567", "USD")
+	bySourceID := make(map[string]brokerage.Activity, len(mapped.Activities))
+	for _, activity := range mapped.Activities {
+		bySourceID[activity.SourceRecordID] = activity
+	}
+
+	eurFee := bySourceID["ibkr-flex:trade:ibexecid:fx-eur-fee"]
+	if eurFee.Type != brokerage.ActivityTransferOut || eurFee.Currency.Code != "EUR" ||
+		math.Abs(eurFee.Fee-1.80416) > 1e-9 {
+		t.Fatalf("EUR-funded FX commission = %#v", eurFee)
+	}
+	usdFee := bySourceID["ibkr-flex:trade:ibexecid:fx-usd-fee:fee"]
+	if usdFee.Type != brokerage.ActivityFee || usdFee.Currency.Code != "USD" ||
+		usdFee.Subtype != "FX_COMMISSION" || usdFee.Amount != 2 {
+		t.Fatalf("USD-funded FX commission = %#v", usdFee)
+	}
+}
+
+func TestMapFlexReportClassifiesDividendTaxTextAndPositiveWithholdingRefund(t *testing.T) {
+	report := flexReport{
+		Accounts: map[string]struct{}{"U1234567": {}},
+		Records: []flexRecord{
+			{Kind: "CashTransaction", Attrs: map[string]string{
+				"accountid": "U1234567", "currency": "USD", "date": "20240102", "amount": "4.28",
+				"type": "Dividends", "description": "Dividend tax adjustment", "transactionid": "dividend",
+			}},
+			{Kind: "CashTransaction", Attrs: map[string]string{
+				"accountid": "U1234567", "currency": "USD", "date": "20240102", "amount": "2.42",
+				"type": "Withholding Tax", "description": "Withholding tax refund", "transactionid": "refund",
+			}},
+			{Kind: "CashTransaction", Attrs: map[string]string{
+				"accountid": "U1234567", "currency": "USD", "date": "20240102", "amount": "-3.00",
+				"type": "Withholding Tax", "description": "Withholding tax", "transactionid": "tax",
+			}},
+		},
+	}
+
+	mapped := mapFlexReport(report, "U1234567", "USD")
+	bySourceID := make(map[string]brokerage.Activity, len(mapped.Activities))
+	for _, activity := range mapped.Activities {
+		bySourceID[activity.SourceRecordID] = activity
+	}
+
+	dividend := bySourceID["ibkr-flex:cashtransaction:transactionid:dividend"]
+	if dividend.Type != brokerage.ActivityDividend || dividend.NeedsReview {
+		t.Fatalf("dividend tax text classification = %#v", dividend)
+	}
+	refund := bySourceID["ibkr-flex:cashtransaction:transactionid:refund"]
+	if refund.Type != brokerage.ActivityCredit || refund.Subtype != "REFUND" || refund.NeedsReview {
+		t.Fatalf("positive withholding classification = %#v", refund)
+	}
+	tax := bySourceID["ibkr-flex:cashtransaction:transactionid:tax"]
+	if tax.Type != brokerage.ActivityTax || tax.NeedsReview {
+		t.Fatalf("negative withholding classification = %#v", tax)
 	}
 }
 

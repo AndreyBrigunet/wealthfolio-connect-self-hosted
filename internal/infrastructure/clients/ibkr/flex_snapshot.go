@@ -126,6 +126,7 @@ func mapFlexSnapshot(report flexReport, remoteAccountID, baseCurrency string, ca
 	connection := brokerage.Connection{
 		ID: "ibkr-conn", AuthorizationID: "ibkr-auth", BrokerageName: flexInstitutionName,
 		BrokerageSlug: "ibkr", DisplayName: flexInstitutionName, Name: "IBKR",
+		LogoURL: flexLogoURL, SquareLogoURL: flexSquareLogoURL,
 		Status: brokerage.ConnectionActive, UpdatedAt: capturedAt.UTC(),
 	}
 	account := brokerage.Account{

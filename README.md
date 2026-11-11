@@ -307,6 +307,9 @@ and the [Activity Flex Query field reference](https://www.ibkrguides.com/reporti
 | `IBKR_FLEX_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout. |
 | `IBKR_FLEX_POLL_INTERVAL_SECONDS` | `5` | Delay between statement-ready checks. |
 | `IBKR_FLEX_POLL_TIMEOUT_SECONDS` | `120` | Maximum wait for one generated statement. |
+| `IBKR_FLEX_REQUEST_INTERVAL_SECONDS` | `20` | Minimum spacing for all Flex HTTP requests across both endpoints; minimum 20 seconds. |
+| `IBKR_FLEX_COOLDOWN_HOURS` | `24` | Suspension after HTTP 403/429 or Flex 1013/1018; minimum 24 hours. |
+| `IBKR_FLEX_STATE_FILE` | empty | JSON state file on a persistent volume; empty keeps protection in memory only. |
 
 For an individual USD account whose history begins in August 2023:
 
@@ -330,9 +333,19 @@ the token. `FX Rate to Base` is preserved per activity; if it is absent, the
 same-day Currency Conversion Rate to the configured base currency is used.
 Flex stops at the previous closed report day. Intraday executions and balance
 changes appear after IBKR finalizes the next Activity Statement.
-Outgoing report-generation calls are paced to IBKR's documented limit of one
-request per second and ten per minute; the importer uses the stricter
-ten-per-minute interval during multi-window backfills.
+Both `SendRequest` and `GetStatement` share a minimum 20-second request
+interval, including during multi-window backfills. HTTP 403/429 and Flex
+1013/1018 stop the current import without retry and suspend further requests
+for at least 24 hours. Manual syncs also respect the configured sync interval,
+measured from the last attempt, including failed attempts.
+
+Set `IBKR_FLEX_STATE_FILE` to persist the last request, last sync attempt and
+suspension deadline across restarts. The file is replaced atomically and never
+contains the Flex token. Invalid or unreadable state prevents client startup;
+failed state writes prevent new requests. Without a state file, protection
+lasts only for the lifetime of the process. Each client instance maintains its
+own guard; other processes and applications using the same IP/token are not
+coordinated. These conservative intervals do not guarantee against IBKR blocks.
 
 For TrueNAS, add those values to the existing host file
 `/mnt/apps/wealthfolio-connect-config/.env`; keep the Compose `env_file` entry
@@ -340,6 +353,36 @@ pointing there. No token needs to appear in the Compose definition. Restart
 `connect` after replacing its image with a build that contains Flex support.
 The first Flex run begins immediately, and subsequent account, holdings and
 history imports follow `IBKR_FLEX_SYNC_INTERVAL_MINUTES`.
+
+For persistent protection on TrueNAS, create a writable state directory for
+the container's UID/GID 65532:
+
+```bash
+sudo install -d -o 65532 -g 65532 -m 700 /mnt/apps/wealthfolio-connect-config/ibkr-flex-state
+```
+
+Add this mount to the existing `connect` service, preserving its other volumes:
+
+```yaml
+volumes:
+  - /mnt/apps/wealthfolio-connect-config/ibkr-flex-state:/var/lib/wealthfolio
+```
+
+Add these conservative settings to the existing host `.env` before starting
+the new image:
+
+```env
+IBKR_FLEX_SYNC_INTERVAL_MINUTES=2880
+IBKR_FLEX_POLL_INTERVAL_SECONDS=60
+IBKR_FLEX_POLL_TIMEOUT_SECONDS=180
+IBKR_FLEX_REQUEST_INTERVAL_SECONDS=20
+IBKR_FLEX_COOLDOWN_HOURS=24
+IBKR_FLEX_STATE_FILE=/var/lib/wealthfolio/ibkr-flex-state.json
+```
+
+The first attempt creates the state file. Verify the mount and directory
+permissions if it is absent; restarting repeatedly does not bypass persisted
+sync intervals or suspensions.
 
 
 ### Interactive Brokers through SnapTrade

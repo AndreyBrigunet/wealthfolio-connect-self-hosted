@@ -46,6 +46,11 @@ func NewFlex(accountID string, cfg config.IBKRFlexConfig, log zerolog.Logger, do
 	if err != nil {
 		return nil, err
 	}
+	guard, err := newFlexGuard(cfg.RequestInterval, cfg.Cooldown, cfg.SyncInterval, cfg.StateFile)
+	if err != nil {
+		return nil, fmt.Errorf("IBKR Flex request guard: %w", err)
+	}
+	api.guard = guard
 	client := &FlexClient{
 		api: api, config: cfg, accountID: strings.TrimSpace(accountID),
 		log: log, now: func() time.Time { return time.Now().UTC() },
@@ -70,6 +75,11 @@ func (c *FlexClient) Fetch(ctx context.Context) (domainsync.BrokerSnapshot, erro
 // FetchAccountSnapshot obtains the latest closed-day account, cash, NAV, and
 // open positions directly from Flex. Activity history is streamed separately.
 func (c *FlexClient) FetchAccountSnapshot(ctx context.Context) (domainsync.BrokerSnapshot, error) {
+	if c.api.guard != nil {
+		if err := c.api.guard.beginSync(); err != nil {
+			return domainsync.BrokerSnapshot{}, err
+		}
+	}
 	today := beginningOfUTCDay(c.now())
 	var lastUnavailable error
 	for daysBack := 1; daysBack <= maxFlexSnapshotLookbackDays; daysBack++ {

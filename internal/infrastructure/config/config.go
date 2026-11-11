@@ -130,6 +130,7 @@ type CryptoConfig struct {
 
 // Config is the single source of truth for runtime configuration.
 type Config struct {
+	Telegram TelegramConfig
 	// Required
 	DatabaseURL               string
 	JWTSecret                 string
@@ -232,6 +233,19 @@ func LoadFrom(get Loader) (*Config, error) {
 		return nil, fmt.Errorf("config: missing required environment variables: %s",
 			strings.Join(missing, ", "))
 	}
+	telegramEnabled, telegramErr := getBool(get, "TELEGRAM_ALERTS_ENABLED")
+	if telegramErr != nil {
+		return nil, telegramErr
+	}
+	cfg.Telegram = TelegramConfig{
+		Enabled:   telegramEnabled,
+		BotToken:  strings.TrimSpace(getString(get, "TELEGRAM_BOT_TOKEN", "")),
+		ChatID:    strings.TrimSpace(getString(get, "TELEGRAM_CHAT_ID", "")),
+		StateFile: getString(get, "TELEGRAM_ALERT_STATE_FILE", "/var/lib/wealthfolio/telegram-alert-state.json"),
+	}
+	if telegramEnabled && (cfg.Telegram.BotToken == "" || cfg.Telegram.ChatID == "") {
+		return nil, errors.New("config: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when alerts are enabled")
+	}
 
 	// Server
 	port, err := getInt(get, "SERVER_PORT", 8080)
@@ -302,6 +316,9 @@ func LoadFrom(get Loader) (*Config, error) {
 	cfg.IBKR.Flex, err = loadIBKRFlex(get, cfg.IBKR)
 	if err != nil {
 		return nil, err
+	}
+	if stateErr := validateTelegramState(cfg.Telegram, cfg.IBKR.Flex.StateFile); stateErr != nil {
+		return nil, stateErr
 	}
 
 	// SnapTrade (read-only access to accounts connected outside this service).

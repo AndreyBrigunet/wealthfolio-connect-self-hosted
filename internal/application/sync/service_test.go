@@ -59,6 +59,20 @@ type pagedClient struct {
 	pages []domainsync.ActivityPage
 }
 
+type observedClient struct {
+	pagedClient
+	streamErr error
+	results   []error
+	streamed  bool
+}
+
+func (c *observedClient) StreamActivities(context.Context, []domainsync.ActivitySyncState, domainsync.ActivitySink) error {
+	c.streamed = true
+	return c.streamErr
+}
+
+func (c *observedClient) SyncFinished(err error) { c.results = append(c.results, err) }
+
 func (f *pagedClient) ID() string { return "paged" }
 func (f *pagedClient) Fetch(context.Context) (domainsync.BrokerSnapshot, error) {
 	return f.snap, nil
@@ -129,6 +143,27 @@ var _ = Describe("sync.Service", func() {
 		s := build(&fakeClient{id: "x", snap: sampleSnap()})
 		Expect(s.RunOnce(context.Background())).To(Succeed())
 		Expect(s.LastRun()).NotTo(BeZero())
+	})
+
+	It("reports activity failures and recovers only after the entire synchronization succeeds", func() {
+		client := &observedClient{streamErr: errors.New("activity failed")}
+		s := build(client)
+		Expect(s.RunOnce(context.Background())).To(Succeed())
+		Expect(client.streamed).To(BeTrue())
+		Expect(client.results).To(HaveLen(1))
+		Expect(client.results[0]).To(MatchError(ContainSubstring("activity failed")))
+		client.streamErr = nil
+		Expect(s.RunOnce(context.Background())).To(Succeed())
+		Expect(client.results).To(HaveLen(2))
+		Expect(client.results[1]).NotTo(HaveOccurred())
+	})
+
+	It("does not report a shutdown cancellation as an incident", func() {
+		client := &observedClient{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		Expect(build(client).RunOnce(ctx)).To(Succeed())
+		Expect(client.results).To(BeEmpty())
 	})
 
 	It("logs and continues when a client fails", func() {

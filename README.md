@@ -385,6 +385,92 @@ permissions if it is absent; restarting repeatedly does not bypass persisted
 sync intervals or suspensions.
 
 
+### Telegram alerts for IBKR Flex
+
+The backend can send Romanian administrator messages for IBKR Flex failures and
+one recovery after the complete snapshot and required activity processing succeeds.
+HTTP 403/429, Flex 1013/1018 and an active guard suspension are critical; other
+genuine sync failures are warnings. Cooldown rejections, overlapping runs and
+normal statement generation do not produce warnings. Monitoring uses the results
+of existing requests and makes no additional IBKR calls. Gateway and other brokers
+are unaffected. Alerts are disabled by default.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TELEGRAM_ALERTS_ENABLED` | `false` | Enables administrator notifications. |
+| `TELEGRAM_BOT_TOKEN` | empty | Secret token obtained from Telegram's `@BotFather`; required when enabled. |
+| `TELEGRAM_CHAT_ID` | empty | Destination private/group chat ID, including a leading minus sign when present; required when enabled. |
+| `TELEGRAM_ALERT_STATE_FILE` | `/var/lib/wealthfolio/telegram-alert-state.json` | Separate incident and pending-delivery state on the existing persistent volume. |
+
+Create a bot with `@BotFather`, open its chat and send `/start`. For a group,
+add the bot and send a command addressed to it. Obtain the `message.chat.id`
+from [getUpdates](https://core.telegram.org/bots/api#getupdates). A bot already
+using a webhook cannot use getUpdates concurrently; use a dedicated alert bot.
+Keep the token private and avoid putting it in browser URLs or command arguments.
+
+This interactive Python 3 snippet, run on your workstation or TrueNAS host,
+lists recent chat IDs and sends **one test message to Telegram only** through
+[sendMessage](https://core.telegram.org/bots/api#sendmessage). It does not start
+the backend, change incident state or contact IBKR. The token is entered without
+echo and is not saved in shell history. Send `/start` first so an update exists.
+
+```bash
+python3 -c '
+import getpass, json, urllib.request
+
+token = getpass.getpass("Telegram bot token: ")
+def call(method, payload):
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot" + token + "/" + method,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        result = json.load(response)
+    if not result.get("ok"):
+        raise RuntimeError("Telegram rejected the request")
+    return result["result"]
+
+try:
+    updates = call("getUpdates", {"timeout": 0, "allowed_updates": ["message"]})
+    ids = {str(u["message"]["chat"]["id"]) for u in updates if "message" in u}
+    print("Recent chat IDs:", ", ".join(sorted(ids)) or "none; send /start first")
+    chat_id = input("Chat ID for one test message (empty cancels): ").strip()
+    if chat_id:
+        call("sendMessage", {"chat_id": chat_id, "text": "✅ Wealthfolio — test Telegram reușit. Nicio cerere către IBKR."})
+        print("Test sent.")
+except Exception:
+    print("Telegram request failed. Check token, chat ID and connectivity.")
+'
+```
+
+On TrueNAS, use the existing `/var/lib/wealthfolio` mount described above, writable
+by UID/GID 65532. Add the four Telegram variables to
+`/mnt/apps/wealthfolio-connect-config/.env` (the existing Compose `env_file`),
+set `TELEGRAM_ALERTS_ENABLED=true`, and recreate `connect` using your normal
+deployment process so the updated environment is loaded. Preserve the same mount
+and state file when upgrading or recreating the container. Do not change or delete
+`ibkr-flex-state.json`; Telegram uses its own file. Allow outbound HTTPS to
+`api.telegram.org`. Set a Compose `stop_grace_period: 30s` or longer so the worker
+can drain during shutdown (its own drain deadline is 20 seconds).
+
+One initial warning is sent per active incident, with one additional notification
+if it escalates to critical. A complete successful sync resolves the incident;
+the next genuine failure opens a new incident. Pending messages and deduplication
+survive restarts. The worker uses a 10-second HTTP timeout and retries failed
+delivery approximately once per minute, without delaying synchronization.
+Notification timestamps use `Europe/Chisinau`, including daylight saving time.
+Messages contain fixed descriptions and numeric codes, never upstream response
+text or account identifiers.
+
+Delivery is at least once: if Telegram accepts a message but its acknowledgement
+or the subsequent local state write is lost, a retry can duplicate it. Persistent
+storage failures produce a warning and fall back to in-memory state; deduplication
+across restarts cannot be guaranteed until storage is repaired. A corrupt or
+unreadable existing IBKR guard file still prevents unsafe backend startup; a
+bounded Telegram delivery is attempted and any saved pending alert is retried on
+the next successful startup. Run only one backend instance per state volume.
+
 ### Interactive Brokers through SnapTrade
 
 This optional integration imports IBKR accounts that are **already connected

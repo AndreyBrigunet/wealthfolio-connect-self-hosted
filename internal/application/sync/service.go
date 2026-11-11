@@ -110,8 +110,16 @@ func (s *Service) runClient(ctx context.Context, c domainsync.BrokerClient) {
 		return
 	}
 	defer s.endClient(c.ID())
-	if err := s.syncOne(ctx, c); err != nil && ctx.Err() == nil {
-		s.log.Error().Err(err).Str("client", c.ID()).Msg("upstream sync failed")
+	err := s.syncOne(ctx, c)
+	if observer, ok := c.(domainsync.SyncObserver); ok && ctx.Err() == nil {
+		observer.SyncFinished(err)
+	}
+	if err != nil && ctx.Err() == nil {
+		logErr := err
+		if sanitizer, ok := c.(domainsync.SyncErrorSanitizer); ok {
+			logErr = sanitizer.SafeSyncError(err)
+		}
+		s.log.Error().Err(logErr).Str("client", c.ID()).Msg("upstream sync failed")
 	}
 	s.mu.Lock()
 	s.lastRun = time.Now().UTC()

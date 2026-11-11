@@ -7,6 +7,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/rs/zerolog"
+	"go.uber.org/fx"
+	"go.uber.org/fx/fxtest"
 
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/domain/sync"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/clients"
@@ -16,6 +18,11 @@ import (
 func TestClientsModule(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Clients Module Suite")
+}
+
+type groupedBrokerClients struct {
+	fx.In
+	Clients []sync.BrokerClient `group:"broker_clients"`
 }
 
 // sampleCfg builds a config with every integration's credentials populated
@@ -87,6 +94,21 @@ var _ = Describe("Client constructors", func() {
 	})
 	It("Module is non-nil", func() {
 		Expect(clients.Module).NotTo(BeNil())
+	})
+	It("wires Flex and its notifier lifecycle without issuing broker requests", func() {
+		settings := &config.Config{IBKR: config.IBKRConfig{Enabled: true, AccountID: "U123", Flex: config.IBKRFlexConfig{Enabled: true, BaseURL: "https://example.com"}}}
+		app := fxtest.New(GinkgoT(), clients.Module, fx.Supply(settings, zerolog.Nop()), fx.Invoke(func(p groupedBrokerClients) {
+			Expect(p.Clients).To(HaveLen(1))
+			_, ok := p.Clients[0].(sync.SyncObserver)
+			Expect(ok).To(BeTrue())
+		}))
+		app.RequireStart()
+		app.RequireStop()
+	})
+	It("fails startup safely when Flex construction fails with alerts disabled", func() {
+		settings := &config.Config{IBKR: config.IBKRConfig{Enabled: true, AccountID: "U123", Flex: config.IBKRFlexConfig{Enabled: true, BaseURL: ":invalid"}}}
+		app := fx.New(clients.Module, fx.NopLogger, fx.Supply(settings, zerolog.Nop()), fx.Invoke(func(groupedBrokerClients) {}))
+		Expect(app.Err()).To(HaveOccurred())
 	})
 	It("omits every unconfigured direct integration", func() {
 		out, err := clients.NewConfiguredClients(&config.Config{}, zerolog.Nop())

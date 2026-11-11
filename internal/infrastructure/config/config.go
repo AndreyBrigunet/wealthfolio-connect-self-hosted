@@ -54,6 +54,9 @@ type IBKRFlexConfig struct {
 	RequestTimeout     time.Duration
 	PollInterval       time.Duration
 	PollTimeout        time.Duration
+	RequestInterval    time.Duration
+	Cooldown           time.Duration
+	StateFile          string
 }
 
 // IBKRConfig groups the master IBKR switch and the mutually exclusive Gateway
@@ -383,6 +386,17 @@ func loadIBKRFlex(get Loader, ibkr IBKRConfig) (IBKRFlexConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
+	requestIntervalSeconds, err := getInt(get, "IBKR_FLEX_REQUEST_INTERVAL_SECONDS", 20)
+	if err != nil {
+		return cfg, err
+	}
+	cooldownHours, err := getInt(get, "IBKR_FLEX_COOLDOWN_HOURS", 24)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RequestInterval = time.Duration(requestIntervalSeconds) * time.Second
+	cfg.Cooldown = time.Duration(cooldownHours) * time.Hour
+	cfg.StateFile = strings.TrimSpace(getString(get, "IBKR_FLEX_STATE_FILE", ""))
 	cfg.SyncInterval = time.Duration(syncMinutes) * time.Minute
 	cfg.IncrementalOverlap = time.Duration(overlapDays) * 24 * time.Hour
 	cfg.RequestTimeout = time.Duration(requestSeconds) * time.Second
@@ -401,6 +415,9 @@ func validateIBKRFlex(cfg *IBKRFlexConfig, ibkr IBKRConfig) error {
 	}
 	if cfg.SyncInterval < time.Hour {
 		return errors.New("config: IBKR_FLEX_SYNC_INTERVAL_MINUTES must be at least 60")
+	}
+	if cfg.Enabled && (cfg.RequestInterval < 20*time.Second || cfg.Cooldown < 24*time.Hour) {
+		return errors.New("config: IBKR Flex requires at least 20 seconds per HTTP request and 24 hours cooldown")
 	}
 	if cfg.IncrementalOverlap < 0 || cfg.IncrementalOverlap > 365*24*time.Hour {
 		return errors.New("config: IBKR_FLEX_INCREMENTAL_OVERLAP_DAYS must be between 0 and 365")

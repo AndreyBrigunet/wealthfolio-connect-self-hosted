@@ -250,6 +250,21 @@ var _ = Describe("IBKR Flex configuration", func() {
 		Expect(cfg.IBKR.Flex.IncrementalOverlap).To(Equal(72 * time.Hour))
 		Expect(cfg.IBKR.Flex.PollInterval).To(Equal(2 * time.Second))
 		Expect(cfg.IBKR.Flex.PollTimeout).To(Equal(time.Minute))
+		Expect(cfg.IBKR.Flex.RequestInterval).To(Equal(20 * time.Second))
+		Expect(cfg.IBKR.Flex.Cooldown).To(Equal(24 * time.Hour))
+		Expect(cfg.IBKR.Flex.StateFile).To(BeEmpty())
+	})
+
+	It("loads persistent protection overrides", func() {
+		cfg, err := config.LoadFrom(mapLoader(enabled(map[string]string{
+			"IBKR_FLEX_REQUEST_INTERVAL_SECONDS": "60",
+			"IBKR_FLEX_COOLDOWN_HOURS":           "48",
+			"IBKR_FLEX_STATE_FILE":               " /var/lib/wealthfolio/state.json ",
+		})))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.IBKR.Flex.RequestInterval).To(Equal(time.Minute))
+		Expect(cfg.IBKR.Flex.Cooldown).To(Equal(48 * time.Hour))
+		Expect(cfg.IBKR.Flex.StateFile).To(Equal("/var/lib/wealthfolio/state.json"))
 	})
 
 	DescribeTable("rejects invalid enabled settings",
@@ -257,6 +272,10 @@ var _ = Describe("IBKR Flex configuration", func() {
 			_, err := config.LoadFrom(mapLoader(enabled(values)))
 			Expect(err).To(MatchError(ContainSubstring(message)))
 		},
+		Entry("short request spacing", map[string]string{"IBKR_FLEX_REQUEST_INTERVAL_SECONDS": "19"}, "at least 20 seconds"),
+		Entry("short cooldown", map[string]string{"IBKR_FLEX_COOLDOWN_HOURS": "23"}, "24 hours cooldown"),
+		Entry("invalid request spacing", map[string]string{"IBKR_FLEX_REQUEST_INTERVAL_SECONDS": "bad"}, "IBKR_FLEX_REQUEST_INTERVAL_SECONDS"),
+		Entry("invalid cooldown", map[string]string{"IBKR_FLEX_COOLDOWN_HOURS": "bad"}, "IBKR_FLEX_COOLDOWN_HOURS"),
 		Entry("disabled gateway", map[string]string{"IBKR_ENABLED": "false"}, "IBKR_ENABLED"),
 		Entry("missing account", map[string]string{"IBKR_ACCOUNT_ID": ""}, "IBKR_ACCOUNT_ID"),
 		Entry("missing token", map[string]string{"IBKR_FLEX_TOKEN": ""}, "IBKR_FLEX_TOKEN"),

@@ -31,6 +31,7 @@ type flexAPI struct {
 	sendEvery   time.Duration
 	sendMu      sync.Mutex
 	lastSend    time.Time
+	guard       *flexGuard
 }
 
 type flexServiceResponse struct {
@@ -100,7 +101,7 @@ func (a *flexAPI) fetch(ctx context.Context, from, to time.Time) (flexReport, er
 		return flexReport{}, fmt.Errorf("decode request response: %w", decodeErr)
 	}
 	if !strings.EqualFold(strings.TrimSpace(response.Status), "Success") {
-		return flexReport{}, redactFlexError(flexResponseError(response), a.token)
+		return flexReport{}, a.protectFlexError(redactFlexError(flexResponseError(response), a.token))
 	}
 	if strings.TrimSpace(response.ReferenceCode) == "" {
 		return flexReport{}, errors.New("ibkr flex: response omitted reference code")
@@ -139,7 +140,7 @@ func (a *flexAPI) fetch(ctx context.Context, from, to time.Time) (flexReport, er
 			return flexReport{}, fmt.Errorf("decode statement response: %w", decodeErr)
 		}
 		if !isFlexPending(response) {
-			return flexReport{}, redactFlexError(flexResponseError(response), a.token)
+			return flexReport{}, a.protectFlexError(redactFlexError(flexResponseError(response), a.token))
 		}
 		if !time.Now().Before(deadline) {
 			return flexReport{}, fmt.Errorf("ibkr flex: statement was not ready within %s", a.pollTimeout)
@@ -193,6 +194,11 @@ func (a *flexAPI) statementURL(raw string) (url.URL, error) {
 }
 
 func (a *flexAPI) get(ctx context.Context, target url.URL) ([]byte, error) {
+	if a.guard != nil {
+		if err := a.guard.reserve(ctx); err != nil {
+			return nil, err
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("build HTTP request: %w", err)
@@ -208,10 +214,14 @@ func (a *flexAPI) get(ctx context.Context, target url.URL) ([]byte, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if _, copyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 4096)); copyErr != nil {
-			return nil, fmt.Errorf("discard HTTP error response: %w", copyErr)
+		var protectionErr error
+		if a.guard != nil {
+			protectionErr = a.guard.tripHTTP(response.StatusCode)
 		}
-		return nil, fmt.Errorf("HTTP status %d", response.StatusCode)
+		if _, copyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 4096)); copyErr != nil {
+			return nil, errors.Join(fmt.Errorf("discard HTTP error response: %w", copyErr), protectionErr)
+		}
+		return nil, errors.Join(fmt.Errorf("HTTP status %d", response.StatusCode), protectionErr)
 	}
 	limited := io.LimitReader(response.Body, flexMaxResponseBytes+1)
 	body, err := io.ReadAll(limited)
@@ -233,6 +243,16 @@ func flexResponseError(response flexServiceResponse) error {
 	return &flexServiceError{Code: code, Message: message}
 }
 
+func (a *flexAPI) protectFlexError(err error) error {
+	var serviceErr *flexServiceError
+	if a.guard != nil && errors.As(err, &serviceErr) {
+		if protectionErr := a.guard.tripFlex(serviceErr.Code); protectionErr != nil {
+			return errors.Join(err, protectionErr)
+		}
+	}
+	return err
+}
+
 func isFlexStatementUnavailable(err error) bool {
 	var serviceErr *flexServiceError
 	return errors.As(err, &serviceErr) && serviceErr.Code == "1003"
@@ -240,7 +260,9 @@ func isFlexStatementUnavailable(err error) bool {
 
 func isFlexPending(response flexServiceResponse) bool {
 	switch strings.TrimSpace(response.ErrorCode) {
-	case "1001", "1004", "1005", "1006", "1007", "1008", "1009", "1018", "1019", "1021":
+	case "1013", "1018":
+		return false
+	case "1001", "1004", "1005", "1006", "1007", "1008", "1009", "1019", "1021":
 		return true
 	default:
 		message := strings.ToLower(response.ErrorMessage)

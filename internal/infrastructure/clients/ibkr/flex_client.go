@@ -23,6 +23,7 @@ const (
 // FlexClient downloads end-of-day account, holdings, and activity data from
 // the IBKR Flex Web Service without requiring IB Gateway or TWS.
 type FlexClient struct {
+	alerts    domainsync.AlertReporter
 	api       *flexAPI
 	config    config.IBKRFlexConfig
 	accountID string

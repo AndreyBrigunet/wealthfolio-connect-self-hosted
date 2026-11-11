@@ -29,6 +29,42 @@ var _ = Describe("Config.LoadFrom", func() {
 	})
 
 	Context("with all required vars present", func() {
+		It("loads optional Telegram settings and validates enabled credentials", func() {
+			cfg, err := config.LoadFrom(mapLoader(base))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cfg.Telegram.Enabled).To(BeFalse())
+			Expect(cfg.Telegram.StateFile).To(Equal("/var/lib/wealthfolio/telegram-alert-state.json"))
+			base["TELEGRAM_ALERTS_ENABLED"] = "true"
+			_, err = config.LoadFrom(mapLoader(base))
+			Expect(err).To(HaveOccurred())
+			base["TELEGRAM_BOT_TOKEN"] = "private"
+			base["TELEGRAM_CHAT_ID"] = "-123"
+			base["TELEGRAM_ALERT_STATE_FILE"] = "/custom/state.json"
+			cfg, err = config.LoadFrom(mapLoader(base))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cfg.Telegram.Enabled).To(BeTrue())
+			Expect(cfg.Telegram.BotToken).To(Equal("private"))
+			Expect(cfg.Telegram.ChatID).To(Equal("-123"))
+			Expect(cfg.Telegram.StateFile).To(Equal("/custom/state.json"))
+			base["TELEGRAM_ALERTS_ENABLED"] = "invalid"
+			_, err = config.LoadFrom(mapLoader(base))
+			Expect(err).To(HaveOccurred())
+		})
+		It("keeps Telegram state separate from the Flex guard", func() {
+			base["TELEGRAM_ALERTS_ENABLED"] = "true"
+			base["TELEGRAM_BOT_TOKEN"] = "private"
+			base["TELEGRAM_CHAT_ID"] = "123"
+			base["TELEGRAM_ALERT_STATE_FILE"] = "/var/lib/wealthfolio/ibkr-flex-state.json"
+			_, err := config.LoadFrom(mapLoader(base))
+			Expect(err).To(HaveOccurred())
+			base["TELEGRAM_ALERT_STATE_FILE"] = "/custom/shared.json"
+			base["IBKR_FLEX_STATE_FILE"] = "/custom/shared.json"
+			_, err = config.LoadFrom(mapLoader(base))
+			Expect(err).To(HaveOccurred())
+			base["TELEGRAM_ALERT_STATE_FILE"] = "/custom/alerts.json"
+			_, err = config.LoadFrom(mapLoader(base))
+			Expect(err).NotTo(HaveOccurred())
+		})
 		It("returns a Config populated with required values and sane defaults", func() {
 			cfg, err := config.LoadFrom(mapLoader(base))
 			Expect(err).NotTo(HaveOccurred())

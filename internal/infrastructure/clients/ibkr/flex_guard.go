@@ -51,10 +51,10 @@ func newFlexGuard(requestInterval, cooldown, syncInterval time.Duration, stateFi
 		return guard, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("ibkr flex guard: read persistent state: %w", err)
+		return nil, &flexStateError{fmt.Errorf("ibkr flex guard: read persistent state: %w", err)}
 	}
 	if err := json.Unmarshal(content, &guard.state); err != nil {
-		return nil, fmt.Errorf("ibkr flex guard: invalid persistent state: %w", err)
+		return nil, &flexStateError{fmt.Errorf("ibkr flex guard: invalid persistent state: %w", err)}
 	}
 	return guard, nil
 }
@@ -67,11 +67,11 @@ func (g *flexGuard) beginSync() error {
 
 	now := g.now().UTC()
 	if now.Before(g.state.BlockedUntil) {
-		return fmt.Errorf("ibkr flex guard: suspended until %s", g.state.BlockedUntil.Format(time.RFC3339))
+		return &flexSkipError{message: fmt.Sprintf("ibkr flex guard: suspended until %s", g.state.BlockedUntil.Format(time.RFC3339)), suspended: true}
 	}
 	next := g.state.LastSyncStart.Add(g.syncInterval)
 	if g.syncInterval > 0 && !g.state.LastSyncStart.IsZero() && now.Before(next) {
-		return fmt.Errorf("ibkr flex guard: next sync permitted after %s", next.Format(time.RFC3339))
+		return &flexSkipError{message: fmt.Sprintf("ibkr flex guard: next sync permitted after %s", next.Format(time.RFC3339))}
 	}
 
 	previous := g.state.LastSyncStart
@@ -95,7 +95,7 @@ func (g *flexGuard) reserve(ctx context.Context) error {
 		if now.Before(g.state.BlockedUntil) {
 			until := g.state.BlockedUntil
 			g.mu.Unlock()
-			return fmt.Errorf("ibkr flex guard: suspended until %s", until.Format(time.RFC3339))
+			return &flexSkipError{message: fmt.Sprintf("ibkr flex guard: suspended until %s", until.Format(time.RFC3339)), suspended: true}
 		}
 		next := g.state.LastRequest.Add(g.requestInterval)
 		if g.requestInterval > 0 && !g.state.LastRequest.IsZero() && now.Before(next) {
@@ -153,6 +153,11 @@ func (g *flexGuard) tripFlex(code string) error {
 }
 
 func (g *flexGuard) saveLocked() (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = &flexStateError{resultErr}
+		}
+	}()
 	if g.stateFile == "" {
 		return nil
 	}

@@ -5,6 +5,7 @@
 package clients
 
 import (
+	"context"
 	"os"
 
 	"github.com/rs/zerolog"
@@ -19,6 +20,7 @@ import (
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/clients/okx"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/clients/snaptrade"
 	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/config"
+	"github.com/wealthfolio/wealthfolio-connect-self-hosted/internal/infrastructure/telegram"
 )
 
 // Module registers every BrokerClient into the broker_clients fx group.
@@ -26,9 +28,10 @@ import (
 // Configured clients are contributed as a flattened group so disabled
 // integrations never enter the scheduler.
 var Module = fx.Module("infrastructure.clients",
+	telegram.Module,
 	fx.Provide(
 		NewSnapTrade,
-		NewConfiguredClients,
+		newManagedConfiguredClients,
 	),
 )
 
@@ -42,6 +45,24 @@ type ConfiguredClientsOut struct {
 // NewConfiguredClients constructs the enabled direct-broker and exchange
 // clients. Missing credentials disable an integration without noisy retries.
 func NewConfiguredClients(cfg *config.Config, log zerolog.Logger) (ConfiguredClientsOut, error) {
+	return configuredClients(cfg, log, nil)
+}
+
+func newManagedConfiguredClients(cfg *config.Config, log zerolog.Logger, alerts *telegram.Notifier) (ConfiguredClientsOut, error) {
+	out, err := configuredClients(cfg, log, alerts)
+	if err != nil && cfg.IBKR.Enabled && cfg.IBKR.Flex.Enabled {
+		alerts.Report(domainsync.Incident{Severity: "WARNING", Reason: "Inițializarea IBKR Flex a eșuat; verificați configurația și starea persistentă"})
+		// Fx does not start lifecycle hooks if a constructor fails.
+		if startErr := alerts.Start(context.Background()); startErr == nil {
+			if stopErr := alerts.Stop(context.Background()); stopErr != nil {
+				log.Warn().Msg("Telegram startup alert drain timed out; check alert state volume")
+			}
+		}
+	}
+	return out, err
+}
+
+func configuredClients(cfg *config.Config, log zerolog.Logger, alerts domainsync.AlertReporter) (ConfiguredClientsOut, error) {
 	if cfg == nil {
 		return ConfiguredClientsOut{}, nil
 	}
@@ -53,6 +74,9 @@ func NewConfiguredClients(cfg *config.Config, log zerolog.Logger) (ConfiguredCli
 		client, err := NewIBKR(cfg, log)
 		if err != nil {
 			return ConfiguredClientsOut{}, err
+		}
+		if flex, ok := client.(*ibkr.FlexClient); ok {
+			flex.SetAlertReporter(alerts)
 		}
 		configured = append(configured, client)
 	}

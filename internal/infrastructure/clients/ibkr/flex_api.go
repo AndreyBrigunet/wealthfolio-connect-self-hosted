@@ -219,9 +219,9 @@ func (a *flexAPI) get(ctx context.Context, target url.URL) ([]byte, error) {
 			protectionErr = a.guard.tripHTTP(response.StatusCode)
 		}
 		if _, copyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 4096)); copyErr != nil {
-			return nil, errors.Join(fmt.Errorf("discard HTTP error response: %w", copyErr), protectionErr)
+			return nil, errors.Join(&flexHTTPError{response.StatusCode}, fmt.Errorf("discard HTTP error response: %w", copyErr), protectionErr)
 		}
-		return nil, errors.Join(fmt.Errorf("HTTP status %d", response.StatusCode), protectionErr)
+		return nil, errors.Join(&flexHTTPError{response.StatusCode}, protectionErr)
 	}
 	limited := io.LimitReader(response.Body, flexMaxResponseBytes+1)
 	body, err := io.ReadAll(limited)

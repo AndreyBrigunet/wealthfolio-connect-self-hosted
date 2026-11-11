@@ -16,6 +16,9 @@ type flexSkipError struct {
 
 func (e *flexSkipError) Error() string { return e.message }
 
+// SyncSkipped marks cooldown and existing suspension rejections as expected skips.
+func (e *flexSkipError) SyncSkipped() bool { return true }
+
 type flexHTTPError struct{ status int }
 
 func (e *flexHTTPError) Error() string { return fmt.Sprintf("HTTP status %d", e.status) }
@@ -35,9 +38,6 @@ func (c *FlexClient) SyncFinished(err error) {
 	}
 	var skip *flexSkipError
 	if errors.As(err, &skip) {
-		if skip.suspended {
-			c.alerts.Report(domainsync.Incident{Severity: "CRITICAL", Reason: "Sincronizarea IBKR Flex este suspendată", Suspended: true})
-		}
 		return
 	}
 	if err == nil {

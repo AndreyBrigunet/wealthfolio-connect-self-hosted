@@ -23,3 +23,9 @@ type SyncObserver interface {
 type SyncErrorSanitizer interface {
 	SafeSyncError(error) error
 }
+
+// SyncSkipError identifies an expected scheduling rejection rather than a failed run.
+type SyncSkipError interface {
+	error
+	SyncSkipped() bool
+}

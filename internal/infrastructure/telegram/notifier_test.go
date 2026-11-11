@@ -106,6 +106,7 @@ var _ = Describe("durable Telegram notifications", func() {
 		n.Report(warning)
 		Eventually(messages).Should(Receive(ContainSubstring("AVERTISMENT")))
 		n.Report(domainsync.Incident{Severity: "WARNING", Reason: "Another failure"})
+		Eventually(messages).Should(Receive(ContainSubstring("Another failure")))
 		n.Report(critical)
 		Eventually(messages).Should(Receive(ContainSubstring("CRITIC")))
 		n.Report(warning)
@@ -173,26 +174,79 @@ var _ = Describe("durable Telegram notifications", func() {
 		_, err := os.Stat(cfg.StateFile)
 		Expect(os.IsNotExist(err)).To(BeTrue())
 	})
-	It("reports corrupt persistent state without stopping delivery", func() {
+	DescribeTable("logs expected IBKR Flex guard skips at debug level without notifying", func(field string) {
+		previousLevel := zerolog.GlobalLevel()
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+		defer zerolog.SetGlobalLevel(previousLevel)
+		guardFile := filepath.Join(filepath.Dir(cfg.StateFile), "guard.json")
+		data, err := json.Marshal(map[string]time.Time{field: time.Now().UTC().Add(time.Hour)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(os.WriteFile(guardFile, data, 0o600)).To(Succeed())
+		client, err := ibkr.NewFlex("U12345678", config.IBKRFlexConfig{BaseURL: "https://example.com", SyncInterval: time.Hour, StateFile: guardFile}, zerolog.Nop(), failingIBKRDoer{})
+		Expect(err).NotTo(HaveOccurred())
+		n := start()
+		client.SetAlertReporter(n)
+		var output bytes.Buffer
+		service := appsync.NewService(appsync.Params{Logger: zerolog.New(&output), Clients: []domainsync.BrokerClient{client}})
+		Expect(service.RunOnce(context.Background())).To(Succeed())
+		Expect(n.Stop(context.Background())).To(Succeed())
+		Expect(output.String()).To(ContainSubstring(`"level":"debug"`))
+		Expect(output.String()).To(ContainSubstring("upstream sync skipped by request guard"))
+		Expect(output.String()).NotTo(ContainSubstring("upstream sync failed"))
+		Expect(output.String()).NotTo(ContainSubstring("U12345678"))
+		Expect(messages).NotTo(Receive())
+		Expect(calls.Load()).To(BeZero())
+	}, Entry("cooldown", "last_sync_start"), Entry("existing suspension", "blocked_until"))
+	It("preserves corrupt persistent state before recovering delivery", func() {
 		Expect(os.WriteFile(cfg.StateFile, []byte("bad json"), 0o600)).To(Succeed())
 		n := start()
 		n.Report(critical)
-		Eventually(messages).Should(Receive(ContainSubstring("stării persistente"))) //nolint:misspell // Romanian notification text.
-		Eventually(messages).Should(Receive(ContainSubstring("CRITIC")))
+		Expect(n.Stop(context.Background())).To(Succeed())
+		var first, second string
+		Expect(messages).To(Receive(&first))
+		Expect(messages).To(Receive(&second))
+		Expect(first + second).To(ContainSubstring("CRITIC"))
+		Expect(first + second).To(ContainSubstring("stării persistente")) //nolint:misspell // Romanian notification text.
+		backups, err := filepath.Glob(cfg.StateFile + ".corrupt-*")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(backups).To(HaveLen(1))
+		original, err := os.ReadFile(backups[0])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(original)).To(Equal("bad json"))
+		restarted := start()
+		restarted.Report(critical)
+		Expect(restarted.Stop(context.Background())).To(Succeed())
+		Expect(messages).NotTo(Receive())
 	})
-	It("warns once if the state directory is unwritable", func() {
+	It("blocks delivery until persistent storage is repaired", func() {
 		Expect(os.WriteFile(cfg.StateFile, nil, 0o600)).To(Succeed())
 		cfg.StateFile = filepath.Join(cfg.StateFile, "impossible.json")
 		n := start()
 		n.Report(critical)
-		Eventually(messages).Should(Receive(ContainSubstring("stării persistente"))) //nolint:misspell // Romanian notification text.
-		Eventually(messages).Should(Receive(ContainSubstring("CRITIC")))
 		Expect(n.Stop(context.Background())).To(Succeed())
-		Consistently(messages, 30*time.Millisecond).ShouldNot(Receive())
+		Expect(messages).NotTo(Receive())
+		Expect(calls.Load()).To(BeZero())
+		// Repair storage, then retry the retained memory queue without restarting.
+		Expect(os.Remove(filepath.Dir(cfg.StateFile))).To(Succeed())
+		n.flush(context.Background())
+		Expect(messages).To(Receive(ContainSubstring("CRITIC")))
+		Expect(messages).To(Receive(ContainSubstring("stării persistente"))) //nolint:misspell // Romanian notification text.
+		restarted := start()
+		restarted.Report(critical)
+		Expect(restarted.Stop(context.Background())).To(Succeed())
+		Expect(messages).NotTo(Receive())
 	})
 	It("bounds shutdown even when Telegram is stalled and preserves the outbox", func() {
 		server.Close()
-		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+		release := make(chan struct{})
+		defer close(release)
+		server = httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
 		n := New(cfg, zerolog.Nop())
 		n.endpoint = server.URL
 		n.client.Timeout = 30 * time.Millisecond
@@ -209,11 +263,16 @@ var _ = Describe("durable Telegram notifications", func() {
 	})
 	It("persists a new critical transition when shutdown interrupts an older delivery", func() {
 		server.Close()
+		release := make(chan struct{})
+		defer close(release)
 		entered := make(chan struct{})
 		server = httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
 			close(entered)
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 		}))
 		data, err := json.Marshal(persistentState{Active: true, Pending: []notification{{Incident: warning, At: time.Now()}}})
 		Expect(err).NotTo(HaveOccurred())

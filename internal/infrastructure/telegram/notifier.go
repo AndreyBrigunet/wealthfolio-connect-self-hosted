@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 	_ "time/tzdata" // Keep Romanian local time correct in minimal containers.
@@ -27,27 +28,30 @@ type notification struct {
 }
 
 type persistentState struct {
-	Active   bool           `json:"active"`
-	Critical bool           `json:"critical"`
-	Pending  []notification `json:"pending,omitempty"`
+	Active    bool                  `json:"active"`
+	Critical  bool                  `json:"critical"`
+	Incidents []domainsync.Incident `json:"incidents,omitempty"`
+	Pending   []notification        `json:"pending,omitempty"`
 }
 
 // Notifier owns one IBKR incident stream and its durable delivery outbox.
 // Report only queues memory operations; disk and HTTP work run on its worker.
 type Notifier struct {
-	cfg         config.TelegramConfig
-	log         zerolog.Logger
-	client      *http.Client
-	endpoint    string
-	mu          sync.Mutex
-	events      []domainsync.Incident
-	closed      bool
-	wake        chan struct{}
-	stop        chan struct{}
-	done        chan struct{}
-	cancel      context.CancelFunc
-	state       persistentState
-	stateFailed bool
+	cfg                   config.TelegramConfig
+	log                   zerolog.Logger
+	client                *http.Client
+	endpoint              string
+	mu                    sync.Mutex
+	events                []domainsync.Incident
+	closed                bool
+	wake                  chan struct{}
+	stop                  chan struct{}
+	done                  chan struct{}
+	cancel                context.CancelFunc
+	state                 persistentState
+	stateFailed           bool
+	loaded                bool
+	storageWarningPending bool
 }
 
 // New builds a notifier without starting goroutines or making requests.
@@ -120,27 +124,21 @@ func (n *Notifier) run(ctx context.Context) {
 	defer func() {
 		// Cancellation can interrupt delivery of an older outbox while new critical
 		// transitions are still queued. Persist those before the worker exits.
-		n.drain()
-		if err := n.save(); err != nil {
+		if err := n.checkpoint(); err != nil {
 			n.persistenceFailure()
 		}
 	}()
-	if err := n.load(); err != nil {
-		n.persistenceFailure()
-	}
 	n.flush(ctx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-n.stop:
-			n.drain()
 			n.flush(ctx)
 			return
 		case <-ctx.Done():
 			return
 		case <-n.wake:
-			n.drain()
 			n.flush(ctx)
 		case <-ticker.C:
 			n.flush(ctx)
@@ -159,13 +157,14 @@ func (n *Notifier) drain() {
 				continue
 			}
 			n.state.Active, n.state.Critical = false, false
+			n.state.Incidents = nil
 		} else {
-			critical := incident.Severity == "CRITICAL"
-			if n.state.Active && (!critical || n.state.Critical) {
+			if slices.Contains(n.state.Incidents, incident) {
 				continue
 			}
 			n.state.Active = true
-			n.state.Critical = critical
+			n.state.Critical = n.state.Critical || incident.Severity == "CRITICAL"
+			n.state.Incidents = append(n.state.Incidents, incident)
 		}
 		n.state.Pending = append(n.state.Pending, notification{incident, time.Now()})
 	}
@@ -176,15 +175,14 @@ func (n *Notifier) persistenceFailure() {
 		return
 	}
 	n.stateFailed = true
+	n.storageWarningPending = true
 	n.log.Warn().Msg("Telegram alert state could not be read or saved; check volume permissions")
-	n.state.Pending = append(n.state.Pending, notification{domainsync.Incident{
-		Severity: "WARNING", Reason: "Citirea sau salvarea stării persistente a alertelor a eșuat", //nolint:misspell // Romanian notification text.
-	}, time.Now()})
 }
 
 func (n *Notifier) flush(ctx context.Context) {
-	if err := n.save(); err != nil {
+	if err := n.checkpoint(); err != nil {
 		n.persistenceFailure()
+		return
 	}
 	for len(n.state.Pending) > 0 && ctx.Err() == nil {
 		if err := n.send(ctx, n.state.Pending[0]); err != nil {
@@ -193,10 +191,35 @@ func (n *Notifier) flush(ctx context.Context) {
 			return
 		}
 		n.state.Pending = n.state.Pending[1:]
-		if err := n.save(); err != nil {
+		if err := n.checkpoint(); err != nil {
 			n.persistenceFailure()
+			return
 		}
 	}
+}
+
+// checkpoint is the delivery gate: never send an outbox that was not saved.
+// A failed acknowledgement write leaves the sent item removed in memory, so
+// retries in this process checkpoint that removal before sending anything else.
+func (n *Notifier) checkpoint() error {
+	if !n.loaded {
+		if err := n.load(); err != nil {
+			return err
+		}
+		n.loaded = true
+	}
+	n.drain()
+	if n.storageWarningPending {
+		n.state.Pending = append(n.state.Pending, notification{domainsync.Incident{
+			Severity: "WARNING", Reason: "Citirea sau salvarea stării persistente a alertelor a eșuat", //nolint:misspell // Romanian notification text.
+		}, time.Now()})
+		n.storageWarningPending = false
+	}
+	if err := n.save(); err != nil {
+		return err
+	}
+	n.stateFailed = false
+	return nil
 }
 
 func (n *Notifier) send(ctx context.Context, item notification) error {
@@ -259,15 +282,55 @@ func (n *Notifier) load() error {
 	if err != nil {
 		return err
 	}
-	var state persistentState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return err
+	state, decodeErr := decodeState(data)
+	if decodeErr != nil {
+		// Preserve the original bytes before allowing any replacement. If the
+		// archive cannot be saved, leave delivery blocked and retry the read later.
+		if _, archiveErr := writeTemporaryState(filepath.Dir(n.cfg.StateFile), filepath.Base(n.cfg.StateFile)+".corrupt-*", data); archiveErr != nil {
+			return fmt.Errorf("preserve corrupt Telegram state: %w", archiveErr)
+		}
+		n.persistenceFailure()
+		return nil
 	}
-	n.state = state
+	// Older files did not retain incident identities. Recover what is available
+	// in the outbox; previously delivered identities cannot be reconstructed.
+	if state.Active && len(state.Incidents) == 0 {
+		for _, item := range state.Pending {
+			if item.Incident.Severity == "" {
+				state.Incidents = nil
+				continue
+			}
+			if !slices.Contains(state.Incidents, item.Incident) {
+				state.Incidents = append(state.Incidents, item.Incident)
+			}
+		}
+	}
+	n.state = *state
 	return nil
 }
 
-func (n *Notifier) save() (resultErr error) {
+func decodeState(data []byte) (*persistentState, error) {
+	var state *persistentState
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return nil, fmt.Errorf("decode alert state: %w", err)
+	}
+	if state == nil || (!state.Active && (state.Critical || len(state.Incidents) > 0)) {
+		return nil, errors.New("invalid alert state")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("unexpected data after alert state")
+	}
+	for _, incident := range state.Incidents {
+		if incident.Severity != "WARNING" && incident.Severity != "CRITICAL" {
+			return nil, errors.New("invalid incident severity in alert state")
+		}
+	}
+	return state, nil
+}
+
+func (n *Notifier) save() error {
 	dir := filepath.Dir(n.cfg.StateFile)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -276,28 +339,42 @@ func (n *Notifier) save() (resultErr error) {
 	if err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(dir, ".telegram-alert-*")
+	name, err := writeTemporaryState(dir, ".telegram-alert-*", data)
 	if err != nil {
 		return err
 	}
+	if err := os.Rename(name, n.cfg.StateFile); err != nil {
+		return errors.Join(err, os.Remove(name))
+	}
+	return nil
+}
+
+func writeTemporaryState(dir, pattern string, data []byte) (name string, resultErr error) {
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
 	defer func() {
+		if resultErr == nil {
+			return
+		}
 		if err := os.Remove(file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove temporary alert state: %w", err))
 		}
 	}()
 	if err := file.Chmod(0o600); err != nil {
-		return errors.Join(err, file.Close())
+		return "", errors.Join(err, file.Close())
 	}
 	if _, err := file.Write(data); err != nil {
-		return errors.Join(err, file.Close())
+		return "", errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
-		return errors.Join(err, file.Close())
+		return "", errors.Join(err, file.Close())
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return "", err
 	}
-	return os.Rename(file.Name(), n.cfg.StateFile)
+	return file.Name(), nil
 }
 
 // Module wires delivery before sync starts, so shutdown stops sync before draining alerts.

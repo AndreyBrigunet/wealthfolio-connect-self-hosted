@@ -61,10 +61,20 @@ type pagedClient struct {
 
 type observedClient struct {
 	pagedClient
-	streamErr error
-	results   []error
-	streamed  bool
+	snapshotErr error
+	streamErr   error
+	results     []error
+	streamed    bool
 }
+
+func (c *observedClient) FetchAccountSnapshot(context.Context) (domainsync.BrokerSnapshot, error) {
+	return c.snap, c.snapshotErr
+}
+
+type expectedSyncSkip struct{}
+
+func (expectedSyncSkip) Error() string     { return "expected request guard skip" }
+func (expectedSyncSkip) SyncSkipped() bool { return true }
 
 func (c *observedClient) StreamActivities(context.Context, []domainsync.ActivitySyncState, domainsync.ActivitySink) error {
 	c.streamed = true
@@ -156,6 +166,12 @@ var _ = Describe("sync.Service", func() {
 		Expect(s.RunOnce(context.Background())).To(Succeed())
 		Expect(client.results).To(HaveLen(2))
 		Expect(client.results[1]).NotTo(HaveOccurred())
+	})
+	It("does not report a guard skip as a failure or a successful recovery", func() {
+		client := &observedClient{snapshotErr: expectedSyncSkip{}}
+		Expect(build(client).RunOnce(context.Background())).To(Succeed())
+		Expect(client.streamed).To(BeFalse())
+		Expect(client.results).To(BeEmpty())
 	})
 
 	It("does not report a shutdown cancellation as an incident", func() {

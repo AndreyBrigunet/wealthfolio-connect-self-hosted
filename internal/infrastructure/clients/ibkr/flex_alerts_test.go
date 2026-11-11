@@ -63,9 +63,10 @@ var _ = Describe("Flex incident classification", func() {
 		client.SyncFinished(fmt.Errorf("fetch: %w", &flexSkipError{message: "next sync permitted after ..."}))
 		Expect(alerts.incidents).To(BeEmpty())
 	})
-	It("recognizes a restored guard suspension", func() {
+	It("does not report an existing guard suspension as a new incident", func() {
 		client.SyncFinished(&flexSkipError{suspended: true})
-		Expect(alerts.incidents[0].Severity).To(Equal("CRITICAL"))
+		Expect(alerts.incidents).To(BeEmpty())
+		Expect((&flexSkipError{suspended: true}).SyncSkipped()).To(BeTrue())
 	})
 	DescribeTable("warns on genuine sync failures", func(err error, code string) {
 		client.SyncFinished(err)

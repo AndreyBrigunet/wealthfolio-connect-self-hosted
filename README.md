@@ -454,20 +454,41 @@ and state file when upgrading or recreating the container. Do not change or dele
 `api.telegram.org`. Set a Compose `stop_grace_period: 30s` or longer so the worker
 can drain during shutdown (its own drain deadline is 20 seconds).
 
-One initial warning is sent per active incident, with one additional notification
-if it escalates to critical. A complete successful sync resolves the incident;
-the next genuine failure opens a new incident. Pending messages and deduplication
-survive restarts. The worker uses a 10-second HTTP timeout and retries failed
-delivery approximately once per minute, without delaying synchronization.
+Each distinct combination of severity, fixed reason, numeric code and suspension
+status is reported once during an active synchronization incident. Repeating an
+already reported failure does not resend it, even if other errors occurred in
+between. A complete successful sync resolves all active failures with one recovery;
+the same failure after recovery opens a new incident. Pending messages and incident
+identities survive restarts. Expected cooldown and existing suspension skips are
+logged at DEBUG and do not generate notifications or recovery. The worker uses a
+10-second HTTP timeout and retries failed delivery approximately once per minute,
+without delaying synchronization.
 Notification timestamps use `Europe/Chisinau`, including daylight saving time.
 Messages contain fixed descriptions and numeric codes, never upstream response
 text or account identifiers.
 
 Delivery is at least once: if Telegram accepts a message but its acknowledgement
 or the subsequent local state write is lost, a retry can duplicate it. Persistent
-storage failures produce a warning and fall back to in-memory state; deduplication
-across restarts cannot be guaranteed until storage is repaired. A corrupt or
-unreadable existing IBKR guard file still prevents unsafe backend startup; a
+storage failures immediately produce a sanitized log warning and pause delivery
+until the outbox can be saved. New transitions remain in memory, and one Telegram
+storage warning is queued for delivery after storage is repaired. After a successful
+send, a failed acknowledgement checkpoint stops further sends; the worker retries
+that checkpoint before delivering more messages, without resending the acknowledged
+message in the same process. A crash before that checkpoint is saved can still cause
+one duplicate on restart. Unsaved memory transitions cannot survive a process exit
+while storage remains unavailable.
+
+A corrupt Telegram state file is first preserved byte-for-byte in a private sibling
+file named `telegram-alert-state.json.corrupt-*` (using the configured filename).
+The worker then starts clean and queues a warning; deduplication history in a corrupt
+file cannot be recovered. If preserving the file fails, the original is left intact
+and delivery stays paused until recovery is possible. Keep diagnostic copies until
+the cause is understood. Older state files containing only active/critical flags
+are migrated; identities still present in the pending outbox are retained, but an
+already delivered failure may be reported once after upgrading because its original
+identity was never stored.
+
+A corrupt or unreadable existing IBKR guard file still prevents unsafe backend startup; a
 bounded Telegram delivery is attempted and any saved pending alert is retried on
 the next successful startup. Run only one backend instance per state volume.
 

@@ -111,15 +111,21 @@ func (s *Service) runClient(ctx context.Context, c domainsync.BrokerClient) {
 	}
 	defer s.endClient(c.ID())
 	err := s.syncOne(ctx, c)
-	if observer, ok := c.(domainsync.SyncObserver); ok && ctx.Err() == nil {
+	var skip domainsync.SyncSkipError
+	skipped := errors.As(err, &skip) && skip.SyncSkipped()
+	if observer, ok := c.(domainsync.SyncObserver); ok && !skipped && ctx.Err() == nil {
 		observer.SyncFinished(err)
 	}
 	if err != nil && ctx.Err() == nil {
-		logErr := err
-		if sanitizer, ok := c.(domainsync.SyncErrorSanitizer); ok {
-			logErr = sanitizer.SafeSyncError(err)
+		if skipped {
+			s.log.Debug().Str("client", c.ID()).Msg("upstream sync skipped by request guard")
+		} else {
+			logErr := err
+			if sanitizer, ok := c.(domainsync.SyncErrorSanitizer); ok {
+				logErr = sanitizer.SafeSyncError(err)
+			}
+			s.log.Error().Err(logErr).Str("client", c.ID()).Msg("upstream sync failed")
 		}
-		s.log.Error().Err(logErr).Str("client", c.ID()).Msg("upstream sync failed")
 	}
 	s.mu.Lock()
 	s.lastRun = time.Now().UTC()
